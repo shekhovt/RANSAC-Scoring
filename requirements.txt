@@ -1,0 +1,6 @@
+matplotlib
+h5py
+opencv-python
+kornia
+scikit-learn
+ipykernel

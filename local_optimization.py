@@ -1,0 +1,265 @@
+import torch
+import torch.func
+from torch import Tensor
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.parameter import Parameter
+from typing import Union, Callable
+import kornia
+
+from .functional import *
+
+
+def SampsonELO(x, y, KX, KY, E) -> Tensor:
+    """
+    x,y [*, N, 3] -- normalized point coordinates
+    E [*, N, 3, 3] -- separate copy of model per point pair (need for Gauss-Newton)
+    KX [*, 3, 3] -- intrinsics matrix for x
+    KY [*, 3, 3]
+    return:
+    residuals [*, N], in pixels
+    """
+    yE = torch.einsum('...i, ...ij -> ...j', y, E)  # [*, N, 3]
+    Ex = torch.einsum('...j, ...ij -> ...i', x, E)  # [*, N, 3]
+    numerator = torch.einsum('...i, ...i', yE, x) + 1e-5  # [*, N]
+    # exctrac focal length from the diagonal
+    fx = torch.diagonal(KX, dim1=-2, dim2=-1)[..., 0:2].unsqueeze(-2)  # [*, 1, 2]
+    fy = torch.diagonal(KY, dim1=-2, dim2=-1)[..., 0:2].unsqueeze(-2)  # [*, 1, 2]
+    denom = (((yE[..., 0:2]/fx)**2 + (Ex[..., 0:2]/fy)** 2).sum(dim=-1) + 1e-20)**0.5  # [*, N]
+    r = numerator/denom  # [*, N]
+    mask = (x[...,-1] == 0)
+    r[mask] = 1e3
+    # r = torch.nan_to_num(r, nan=1e3)
+    return r # signed residual # needed for optimization
+
+
+def compose_essential_matrix(R, t):
+    Tx = kornia.geometry.epipolar.cross_product_matrix(t)
+    return Tx @ R
+
+
+class E_parameterization:
+    def __init__(self, E: Tensor):
+        """
+        E [*, 3, 3] -- essential matrices
+        """
+        super().__init__()
+        # decompose E into R,t, hopefully works in batches
+        self.E0 = E
+        R1, R2, t = kornia.geometry.epipolar.decompose_essential_matrix(E)
+        self.bs = list(E.shape)[:-2]  # batch shape
+        # 6 parameters per essential matrix
+        self.param = E.new_zeros(self.bs + [7])
+        self.param.requires_grad = True
+        self.t = t.squeeze(-1)  # set translation
+        self.R = R1  # any is good
+        # rotatino is modelled incrementally to R
+        # set quaternion to [1,0,0,0] -- identity rotation
+        self.q.data[..., 0] = 1
+        E1 = self.forward()  # up to scale, posibly also negative
+        pass
+
+    @property
+    def t(self):
+        return self.param[..., 0:3]
+
+    @t.setter
+    def t(self, v):
+        self.param.data[..., 0:3] = v
+
+    @property
+    def q(self):
+        return self.param[..., 3:]
+
+    # @q.setter
+    # def q(self, v):
+        # self.param.data[..., 3:] = v
+
+    def forward(self):
+        # compose back essential matrix with parametric translation and rotation
+        # v = self.v
+        # s = list(self.v.shape)
+        # s[-1] = 1
+        # v = torch.cat((v.new_ones(s), v), dim=-1)
+        # q = F.normalize(v, dim=-1)
+        t = F.normalize(self.t, dim=-1) # translation vector is up to global scale
+        q = F.normalize(self.q, dim=-1) # quaternion vector must be normalized
+        dR = kornia.geometry.conversions.quaternion_to_rotation_matrix(q)
+        # batched matrix multiplication
+        R = torch.einsum('...ij, ...jk -> ...ik', self.R, dR)
+        E = compose_essential_matrix(R, t)
+        return E
+
+    # def Jacobian(s§elf):
+    #     params = dict(self.named_parameters())
+
+    #     def func(pp):
+    #         F = torch.func.functional_call(self, pp, tuple())
+    #         F = F.flatten(start_dim=-2)
+    #         return F.sum(dim=0)  # for each batch dimension, independent inputs
+    #     J_f = torch.func.jacrev(func)
+    #     J = J_f(params)["param"]
+    #     return J
+    def Jacobian(self):
+        def func(param):
+            p = self.param
+            self.param = param
+            F = self.forward()
+            self.param = p
+            F = F.flatten(start_dim=-2)
+            return F.sum(dim=0)  # for each batch dimension, independent inputs
+        J_f = torch.func.jacrev(func)
+        J = J_f(self.param)
+        return J
+
+
+# def SampsonBM(x: Tensor, y: Tensor, F: Tensor) -> Tensor:
+#     """
+#     x [B x n x 3]
+#     y [B x n x 3]
+#     F [B x M x 3 x 3]
+#     """
+#     xF = torch.einsum('bni, bmij -> bmnj', x, F)  # [M, n, 3]
+#     Fy = torch.einsum('bnj, bmij -> bmni', y, F)  # [M, n, 3]
+#     numerator = torch.einsum('bni, bnj, bmij -> bmn', x, y, F)  # [M, n]
+#     denom = ((xF[..., 0:2]**2 + Fy[..., 0:2]**2).sum(dim=-1))**0.5
+#     return numerator/denom  # [B, M, n]
+
+
+# def compute_residuals_ref(x, y, KX, KY, E):
+#     K1 = KX
+#     K2 = KY
+#     K1I = K1.inverse()
+#     K2I = K2.inverse()
+#     # convert E to F and unnormalize points
+#     F = torch.einsum('bij, bmik, bkl -> bmjl', K2I,
+#                      E, K1I)  # K2^{-T} E K1^{-1}
+#     # (K1)x in the format [b,n,3]
+#     x = torch.einsum('bij, bnj -> bni', K1, x)
+#     # (K2)y in the format [b,n,3]
+#     y = torch.einsum('bij, bnj -> bni', K2, y)
+#     r = SampsonBM(y, x, F).abs()  # *scale.view([-1,1,1]) #[B M N]
+#     r = torch.nan_to_num(r, nan=float('inf'))
+#     return r.abs()
+
+
+def local_optimization(x: Tensor, y: Tensor, KX, KY, model: nn.Module, score_f:Callable, weight_f: Callable, iterations: int = 20, damping_mult=1):
+    """
+    x,y [*, N, 3] -- normalized point pairs
+    KX, KY -- intrinsics
+    model --- nn.module with forward defining essential matrx of shape [*, 3, 3]
+    score(residuals) -- scoring function, differentiable in residuals
+    return:
+    optimized models E [*, 3, 3], optimized score [*]
+    """
+    # x = torch.nan_to_num(x, posinf=1e3)
+    # y = torch.nan_to_num(y, posinf=-1e3)
+    mask = torch.isinf(x).any(dim=-1, keepdim=True).expand(x.shape)
+    x[mask] = 0
+    y[mask] = 0
+    s0 = None
+    N = x.shape[-2]  # number of points (padded in a batch)
+    damping_mult = x.new_ones(x.shape[0])*damping_mult
+    method = 'GN'
+    for it in range(iterations+1):
+        # forward compose essential matrix
+        E = model.forward()
+        # check
+        if False:
+            rr1 = compute_residuals_ref(
+                x, y, KX, KY, model.E0.view([-1, 1, 3, 3])).squeeze(1)
+            s1 = score(rr1)  # [*, N]
+            print("s1", s1.sum(dim=-1)[0:10].cpu().detach().numpy())
+
+            [U, S, V] = torch.svd(model.E0)
+            S = S / S.max(dim=-1, keepdim=True)[0]
+            S[S > 0.5] = 1
+            S[S < 0.5] = 0
+            # recompose
+            for b in range(S.shape[0]):
+                E[b] = torch.mm(torch.mm(U[b], torch.diag(S[b])), V[b].t())
+
+            rr2 = compute_residuals_ref(
+                x, y, KX, KY, E.view([-1, 1, 3, 3])).squeeze(1)
+            s2 = score(rr2)  # [*, N]
+            print("s2", s2.sum(dim=-1)[0:10].cpu().detach().numpy())
+
+        # separate copy per point to compute separate gradient
+        EE = unsqueeze_expand(E, -3, N)  # [*, N, 3, 3]
+        rr = SampsonELO(x, y, KX, KY, EE) # signed residuals
+        s = score_f(rr).sum(dim=-1)  # [*, N]
+        if s0 is not None:
+            # check improvement
+            mask_backtrack = s0 > s
+            model.param.data[mask_backtrack] = p0[mask_backtrack]
+            damping_mult[mask_backtrack] *= 3 # more damping
+            if mask_backtrack.any().item():
+                # print('backtracking:', mask_backtrack.sum().item())
+                # recompute sampson errors
+                E = model.forward()
+                EE = unsqueeze_expand(E, -3, N)  # [*, N, 3, 3]
+                rr = SampsonELO(x, y, KX, KY, EE)  # signed residuals
+                s = score_f(rr).sum(dim=-1)  # [*, N]
+        else:
+            # print(s.cpu().detach().numpy())
+            s00 = s.detach().clone()
+        if it == iterations:
+            # print((s-s00).cpu().detach().numpy())
+            assert((s >= s00).all())
+            return E.detach(), s.detach()
+        s0 = s.detach().clone()
+        p0 = model.param.clone()
+        # debug, print score, expect increasing
+        if method == 'GD':
+            model.zero_grad()
+            (s.sum()/N).backward()  # full grad down to parameters
+            for p in model.parameters():
+                # maximizing score
+                p.data += lr*p.grad
+        elif method == 'GN':
+            """
+            GN rquires a single parameter vector, otherwise we cannot do JJ' and solve
+            Our quality is
+            Q(x) = \sum_i f_i(x)^2
+            Linearizing f(x + dx) = f(x) + J dx
+            J = df_i/ d x_j
+            Q(x + dx) = \sum_i (f_i + J_i dx)^2 = sim_i f_i^2 + 2*f_i*J_i dx + (J_i dx)^2
+            = 2*f'J dx + dx' J'J dx
+            maximize:
+            0 = 2*f'J + 2* dx'J'J
+            0 = J'f + J'Jdx
+            dx = -(J'J)^{-1} J'f
+            """
+            with torch.no_grad():
+                weight = weight_f(rr)
+            rr = rr /1000 # just to fix the scale
+            J1 = torch.autograd.grad(rr.sum(), EE, retain_graph=True)[0]  # [*, N, 3, 3]
+            # f = (1-s + 1e-5) ** 0.5 / N   # [*, N] square root for G-N
+            # J1a = torch.autograd.grad(f.sum(), EE, retain_graph=True)[0]  # [*, N, 3, 3]
+            # gradient of all residuals in E
+            # J1 = torch.autograd.grad(rr.sum(), EE, retain_graph=True)[0]  # [*, N, 3, 3]
+            assert (not J1.isnan().any())
+            J1 = J1.flatten(start_dim=-2)  # [*, N, 9]
+            # Jacobian of E in model parameters
+            J2 = model.Jacobian()  # [9, *, 7]
+            assert (not J2.isnan().any())
+            with torch.no_grad():
+                # J2 = J2.flatten(end_dim=1)  # [9,*,7]
+                # apply it on J1
+                J = torch.einsum('i...j, ...ni -> ...nj', J2, J1)  # [*, N, d]
+                # compose JJ'
+                # JJ = torch.einsum('...ni, ...nj -> ...ij', J, J)  # [*, d, d]
+                G = torch.einsum('...ni, ...nj,...n -> ...ij', J, J, weight)  # [*, d, d]
+                # damping (we have a non-minimal parameterization)
+                # JJ = JJ + 10000*torch.eye(JJ.shape[-1],dtype=JJ.dtype, device = JJ.device).unsqueeze(0)
+                # G = G + 1e-3*torch.eye(G.shape[-1],dtype=G.dtype, device = G.device).unsqueeze(0)
+                Gdiag = torch.diagonal(G, dim1=-1, dim2=-2)
+                m = damping_mult.unsqueeze(-1)
+                Gdiag[:] = Gdiag[:]*(1+1e-4*m) + 1e-3*m
+                # compute J f
+                # b = torch.einsum('...ni, ...n -> ...i', J, f)  # [*, d]
+                b = torch.einsum('...ni, ...n, ...n -> ...i', J, rr, weight)  # [*, d]
+                # solve for next parameter
+                p_delta = torch.linalg.solve(G, b)
+            model.param.data -= p_delta
+    E = model.forward()
