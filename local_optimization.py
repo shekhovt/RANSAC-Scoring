@@ -244,22 +244,126 @@ def local_optimization(x: Tensor, y: Tensor, KX, KY, model: nn.Module, score_f:C
             J2 = model.Jacobian()  # [9, *, 7]
             assert (not J2.isnan().any())
             with torch.no_grad():
-                # J2 = J2.flatten(end_dim=1)  # [9,*,7]
                 # apply it on J1
-                J = torch.einsum('i...j, ...ni -> ...nj', J2, J1)  # [*, N, d]
+                J = torch.einsum('i...j, ...ni -> ...nj', J2, J1)  # [*, N, d], d = 7 -- marameters dimension
                 # compose JJ'
-                # JJ = torch.einsum('...ni, ...nj -> ...ij', J, J)  # [*, d, d]
                 G = torch.einsum('...ni, ...nj,...n -> ...ij', J, J, weight)  # [*, d, d]
                 # damping (we have a non-minimal parameterization)
-                # JJ = JJ + 10000*torch.eye(JJ.shape[-1],dtype=JJ.dtype, device = JJ.device).unsqueeze(0)
-                # G = G + 1e-3*torch.eye(G.shape[-1],dtype=G.dtype, device = G.device).unsqueeze(0)
-                Gdiag = torch.diagonal(G, dim1=-1, dim2=-2)
+                Gdiag = torch.diagonal(G, dim1=-1, dim2=-2) ## a view of the diagonal
                 m = damping_mult.unsqueeze(-1)
                 Gdiag[:] = Gdiag[:]*(1+1e-4*m) + 1e-3*m
                 # compute J f
-                # b = torch.einsum('...ni, ...n -> ...i', J, f)  # [*, d]
                 b = torch.einsum('...ni, ...n, ...n -> ...i', J, rr, weight)  # [*, d]
                 # solve for next parameter
                 p_delta = torch.linalg.solve(G, b)
             model.param.data -= p_delta
     E = model.forward()
+
+
+class LocalOptimization_LMA:
+    """
+    Optimize sum of squared residuals, non-linearly dependent on the geometric model, non-linearly parameterized
+    """
+    def __init__(self, N:int, model:nn.Module, residual_f:Callable, score_f:Callable=None, weight_f: Callable = None, damping_mult=1):
+        """
+        N -- number of points
+        residual_f(EE) --- should return [N] residuals, one per data point, provided essential matrix E, expanded to N copies as [N, 3, 3]
+        model --- nn.module with forward defining essential matrx of shape [3, 3]
+        score_f and weight_f will be needed in case of optimizing the robust version of the loss
+            score_f --- computes the robust score
+            weight_f --- computes probabilities of points being inliers
+        """
+        def default_score(rr):
+            return rr**2
+        
+        def default_weight(rr):
+            return torch.ones_like(rr)
+
+        self.residual_f = residual_f
+        self.score_f = score_f if score_f is not None else default_score
+        self.weight_f = weight_f  if weight_f is not None else default_weight
+        self.damping_mult = damping_mult
+        self.model = model
+        self.N = N
+        self.s = None # current best score
+        self.rr = None
+        self.p = None # model params copy
+
+    def compute_residuals_and_scores(self, E):
+        # separate copy per point to compute separate gradient
+        EE = unsqueeze_expand(E, -3, self.N)  # [*, N, 3, 3]
+        rr = self.residual_f(EE)
+        s = self.score_f(rr).sum(dim=-1)  # [*, N]
+        return EE, rr, s 
+
+    def iteration(self):
+        # evaluate score
+        """
+        return:
+        current model E [3, 3], current score
+        """
+        N = self.N
+        
+        if self.s is None:
+            E = self.model.forward()
+            EE, rr, self.s = self.compute_residuals_and_scores(E)
+            self.p = self.model.param.clone()
+        else:
+            EE = self.EE
+            rr = self.rr
+        """
+        GN rquires a single parameter vector, otherwise we cannot do JJ' and solve
+        Our quality is
+        Q(x) = \sum_i f_i(x)^2
+        Linearizing f(x + dx) = f(x) + J dx
+        J = df_i/ d x_j
+        Q(x + dx) = \sum_i (f_i + J_i dx)^2 = sim_i f_i^2 + 2*f_i*J_i dx + (J_i dx)^2
+        = 2*f'J dx + dx' J'J dx
+        maximize:
+        0 = 2*f'J + 2* dx'J'J
+        0 = J'f + J'Jdx
+        dx = -(J'J)^{-1} J'f
+        """
+        with torch.no_grad():
+            weight = self.weight_f(rr)
+        rr = rr /1000 # just to fix the scale for regularization
+        J1 = torch.autograd.grad(rr.sum(), EE, retain_graph=True)[0]  # [*, N, 3, 3] -- Gradient of all residuals in E
+        assert (not J1.isnan().any())
+        J1 = J1.flatten(start_dim=-2)  # [*, N, 9]
+        # Jacobian of E in model parameters
+        J2 = self.model.Jacobian()  # [9, *, 7]
+        assert (not J2.isnan().any())
+        with torch.no_grad():
+            # apply it on J1
+            J = torch.einsum('i...j, ...ni -> ...nj', J2, J1)  # [*, N, d], d = 7 -- marameters dimension
+            # compose JJ'
+            G = torch.einsum('...ni, ...nj,...n -> ...ij', J, J, weight)  # [*, d, d]
+            # compute J f
+            b = torch.einsum('...ni, ...n, ...n -> ...i', J, rr, weight)  # [*, d]            
+        while True:
+            # try with current damping, until get an improvmeent
+            m = self.damping_mult                
+            GD = G.clone()
+            # damping (we have a non-minimal parameterization)
+            GDdiag = torch.diagonal(GD, dim1=-1, dim2=-2) ## a view of the diagonal
+            GDdiag[:] = GDdiag[:]*(1+1e-4*m) + 1e-3*m    
+            # solve for next parameter
+            p_delta = torch.linalg.solve(G, b)
+            # step, maximization
+            self.model.param.data -= p_delta
+            # check improvement
+            new_E = self.model.forward() # current model
+            new_EE, new_rr, new_s = self.compute_residuals_and_scores(new_E)
+            if new_s < self.s0: # did not improve over s0, backtrack:
+                self.model.param.data = self.p
+                self.damping_mult *= 3 # more damping
+            else: # successfully improved
+                self.damping_mult *= 1.5 # less damping                
+                # s has improved, remember as current best
+                self.s = new_s.detach().clone()
+                self.p = self.model.param.clone()
+                self.EE = new_EE
+                self.rr = new_rr
+                return new_E, new_s
+
+
