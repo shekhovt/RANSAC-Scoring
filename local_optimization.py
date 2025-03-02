@@ -507,15 +507,16 @@ if __run__:
     print('================')
     print('SGD (200 it)')
     # opt = torch.optim.Adam([model.param], lr=1e-3, betas = (0.0,0.99))
-    opt = torch.optim.SGD([model.param], lr=1e-5, momentum=0.0)
-    for it in range(200):
+    opt = torch.optim.SGD([model.param], lr=1e-4, momentum=0.0)
+    for it in range(20000):
         opt.zero_grad()
         l = loss()
         l.backward()
         opt.step()
-    print(l.item())
+        if it %100 == 0:
+            print(l.item())
 
     print('GGN')
-    GGN = LocalOptimization_GGN(N,model, test_loss, damping_mult=1000)
+    GGN = LocalOptimization_GGN(N,model, test_loss, damping_mult=10)
     for it, (E, l) in enumerate(GGN):
         print(it, l.item())
