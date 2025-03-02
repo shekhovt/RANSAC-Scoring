@@ -383,7 +383,7 @@ class LocalOptimization_GGN:
     """
     Generalized Gauss Newton
     """
-    def __init__(self, N:int, model:nn.Module, loss_f:Callable, damping_mult=1e-3, max_iterations=50):
+    def __init__(self, N:int, model:nn.Module, loss_f:Callable, damping_mult=1e-5, max_iterations=50):
         """
         N -- number of points
         loss_f(EE) --- loss to miminize, see example below
@@ -423,6 +423,7 @@ class LocalOptimization_GGN:
         J1 = torch.autograd.grad(ff.sum(), EE, retain_graph=True)[0]  # [*, N, 3, 3] -- Gradient of all residuals in E
         J1 = J1.flatten(start_dim=-2)  # [*, N, 9]
         #
+        self.model.param.grad = None
         self.loss.backward()
         # Jacobian of E in model parameters
         # compute sum_i w_i J1_i J1_i.T
@@ -438,8 +439,8 @@ class LocalOptimization_GGN:
             GD = G.clone()
             # damping (we have a non-minimal parameterization)
             GDdiag = torch.diagonal(GD, dim1=-1, dim2=-2) ## a view of the diagonal
-            # GDdiag[:] = GDdiag[:]*(1+1e-4*m) + 1e-3*m
-            GDdiag[:] = GDdiag[:] + 1e-3*m
+            GDdiag[:] = GDdiag[:]*(1+1e-4*m) + 1e-3*m
+            # GDdiag[:] = GDdiag[:] + 1e-3*m
             # solve for critcal point of quadratic approx
             p_delta = -torch.linalg.solve(GD, g)
             # step, to that critical point
@@ -453,7 +454,7 @@ class LocalOptimization_GGN:
                 print('<', end='')
             else: # successfully improved
                 print('>', end='')
-                self.damping_mult *= 1.5 # less damping                
+                self.damping_mult *= 1.5 # less damping
                 # s has improved, remember as current best
                 self.loss = new_loss # keep it differentiable
                 self.EE = new_EE
@@ -479,6 +480,9 @@ if __run__:
     f = torch.einsum('ni,ij,nj->n',Y, E, X)
     assert((f.abs() < 1e-6).all())
 
+    # X = X + torch.rand(X.shape, dtype=X.dtype)*0.001
+    # Y = Y + torch.rand(X.shape, dtype=Y.dtype)*0.001
+
     model = E_parameterization(E)
 
     def test_loss(E):
@@ -497,26 +501,26 @@ if __run__:
 
     print('Loss at GT:', loss().item())
     model = E_parameterization(E + torch.rand(3,3, dtype= torch.float64)*0.2)
-    print('Loss perturbed:', loss().item())
+    print('Loss at perturbed init:', loss().item())
 
     print('GGN')
-    GGN = LocalOptimization_GGN(N,model, test_loss, damping_mult=10)
+    GGN = LocalOptimization_GGN(N,model, test_loss, damping_mult=1e-5)
     for it, (E, l) in enumerate(GGN):
         print(it, l.item())
 
-    print('================')
-    print('SGD (200 it)')
-    # opt = torch.optim.Adam([model.param], lr=1e-3, betas = (0.0,0.99))
-    opt = torch.optim.SGD([model.param], lr=1e-4, momentum=0.0)
-    for it in range(20000):
-        opt.zero_grad()
-        l = loss()
-        l.backward()
-        opt.step()
-        if it %100 == 0:
-            print(l.item())
+    # print('================')
+    # print('SGD test')
+    # # opt = torch.optim.Adam([model.param], lr=1e-3, betas = (0.0,0.99))
+    # opt = torch.optim.SGD([model.param], lr=1e-4, momentum=0.0)
+    # for it in range(20000):
+    #     opt.zero_grad()
+    #     l = loss()
+    #     l.backward()
+    #     opt.step()
+    #     if it %100 == 0:
+    #         print(l.item())
 
-    print('GGN')
-    GGN = LocalOptimization_GGN(N,model, test_loss, damping_mult=10)
-    for it, (E, l) in enumerate(GGN):
-        print(it, l.item())
+    # print('GGN')
+    # GGN = LocalOptimization_GGN(N,model, test_loss, damping_mult=1e-3)
+    # for it, (E, l) in enumerate(GGN):
+    #     print(it, l.item())
