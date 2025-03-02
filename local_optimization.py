@@ -61,10 +61,10 @@ class E_parameterization:
         R1, R2, t = kornia.geometry.epipolar.decompose_essential_matrix(E)
         self.bs = list(E.shape)[:-2]  # batch shape
         # 6 parameters per essential matrix
-        self.param = E.new_zeros(self.bs + [7])
+        self.param = E.new_zeros(self.bs + [7], dtype=torch.float64)
         self.param.requires_grad = True
         self.t = t.squeeze(-1)  # set translation
-        self.R = R1  # any is good
+        self.R = R1.to(self.param)  # any is good
         # rotatino is modelled incrementally to R
         # set quaternion to [1,0,0,0] -- identity rotation
         self.q.data[..., 0] = 1
@@ -466,28 +466,27 @@ class LocalOptimization_GGN:
 
 if __run__:
     torch.manual_seed(0)
-    E = torch.rand(3,3)
+    E = torch.rand(3,3, dtype= torch.float64)
     R, _, t = kornia.geometry.epipolar.decompose_essential_matrix(E)
     t = t.squeeze(-1)
     R = R.squeeze(0)
     E = compose_essential_matrix(R, t)
     N = 100
-    X = torch.cat([torch.rand(N,2), torch.ones(N,1)], dim=-1) # [N 3]
+    X = torch.cat([torch.rand(N,2, dtype= torch.float64), torch.ones(N,1, dtype= torch.float64)], dim=-1) # [N 3]
     Y = (X) @ R.T - t
     # X and Y are noise-free forrespondences
     # check they satisfy epipolar constraint:
     f = torch.einsum('ni,ij,nj->n',Y, E, X)
-    print(f)
+    assert((f.abs() < 1e-6).all())
 
-    # model = E_parameterization(torch.rand(3,3))
-    model = E_parameterization(E + torch.rand(3,3)*0.1)
+    model = E_parameterization(E)
 
     def test_loss(E):
          # algebraic error
         EE = unsqueeze_expand(E, -3, N)  # [N, 3, 3]        
         ff = torch.einsum('ni,nj,...nij->...n', Y,X, EE)
-        ww =  torch.ones(N)
-        c = torch.zeros(N)
+        ww =  torch.ones(N).to(ff)
+        c = torch.zeros(N).to(ff)
         losses = ff**2 / ww + c
         return losses.sum(dim=-1), EE, ff, ww
     
@@ -496,7 +495,9 @@ if __run__:
         ll , _, _, _ = test_loss(E)
         return ll.sum()
 
-    print(loss().item())
+    print('Loss at GT:', loss().item())
+    model = E_parameterization(E + torch.rand(3,3, dtype= torch.float64)*0.2)
+    print('Loss perturbed:', loss().item())
 
     print('GGN')
     GGN = LocalOptimization_GGN(N,model, test_loss, damping_mult=10)
@@ -506,7 +507,7 @@ if __run__:
     print('================')
     print('SGD (200 it)')
     # opt = torch.optim.Adam([model.param], lr=1e-3, betas = (0.0,0.99))
-    opt = torch.optim.SGD([model.param], lr=1e-4, momentum=0.0)
+    opt = torch.optim.SGD([model.param], lr=1e-5, momentum=0.0)
     for it in range(200):
         opt.zero_grad()
         l = loss()
