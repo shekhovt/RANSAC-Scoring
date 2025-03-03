@@ -90,12 +90,6 @@ class E_parameterization:
         # self.param.data[..., 3:] = v
 
     def forward(self):
-        # compose back essential matrix with parametric translation and rotation
-        # v = self.v
-        # s = list(self.v.shape)
-        # s[-1] = 1
-        # v = torch.cat((v.new_ones(s), v), dim=-1)
-        # q = F.normalize(v, dim=-1)
         t = F.normalize(self.t, dim=-1) # translation vector is up to global scale
         q = F.normalize(self.q, dim=-1) # quaternion vector must be normalized
         dR = kornia.geometry.conversions.quaternion_to_rotation_matrix(q)
@@ -104,16 +98,7 @@ class E_parameterization:
         E = compose_essential_matrix(R, t)
         return E
 
-    # def Jacobian(s§elf):
-    #     params = dict(self.named_parameters())
-
-    #     def func(pp):
-    #         F = torch.func.functional_call(self, pp, tuple())
-    #         F = F.flatten(start_dim=-2)
-    #         return F.sum(dim=0)  # for each batch dimension, independent inputs
-    #     J_f = torch.func.jacrev(func)
-    #     J = J_f(params)["param"]
-    #     return J
+    @torch.compile(dynamic = True, backend = "inductor", mode="reduce-overhead")
     def Jacobian(self):
         def func(param):
             p = self.param
@@ -387,9 +372,11 @@ class LocalOptimization_GGN_Batch:
             self.damping_mult = self.loss.new_ones(B)*damping_mult
 
     def __iter__(self):
+        # torch._functorch.config.donated_buffer=False 
         self.iteration = 0
         return self
 
+    # @torch.compile(dynamic = True, backend = "inductor", mode="reduce-overhead")
     def __next__(self):
         """
         return:
@@ -464,9 +451,11 @@ if __run__:
 
     model = E_parameterization(E)
 
-    def test_loss(E):
+    def test_loss(E:Tensor):
          # algebraic error
         EE = unsqueeze_expand(E, -3, N)  # [...,N, 3, 3]
+        # if E.requires_grad:
+            # EE.retain_grad()
         ff = torch.einsum('ni,nj,...nij->...n', Y,X, EE)
         ww =  torch.ones(ff.shape).to(ff)
         c = torch.zeros(ff.shape).to(ff)
