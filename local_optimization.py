@@ -58,12 +58,14 @@ class E_parameterization:
         super().__init__()
         # decompose E into R,t, hopefully works in batches
         self.E0 = E
-        R1, R2, t = kornia.geometry.epipolar.decompose_essential_matrix(E)
+        R1, _, t = kornia.geometry.epipolar.decompose_essential_matrix(E)
         self.bs = list(E.shape)[:-2]  # batch shape
+        if self.bs == []:
+            R1 = R1.squeeze(0)
         # 6 parameters per essential matrix
         self.param = E.new_zeros(self.bs + [7], dtype=torch.float64)
         self.param.requires_grad = True
-        self.t = t.squeeze(-1)  # set translation
+        self.t = t.squeeze(-1)  # set translation        
         self.R = R1.to(self.param)  # any is good
         # rotatino is modelled incrementally to R
         # set quaternion to [1,0,0,0] -- identity rotation
@@ -119,7 +121,10 @@ class E_parameterization:
             F = self.forward()
             self.param = p
             F = F.flatten(start_dim=-2)
-            return F.sum(dim=0)  # for each batch dimension, independent inputs
+            if p.dim()>1:
+                return F.sum(dim=tuple(range(p.dim()-1)))  # for each batch dimension, independent inputs
+            else:
+                return F
         J_f = torch.func.jacrev(func)
         J = J_f(self.param)
         return J
@@ -272,113 +277,6 @@ def local_optimization(x: Tensor, y: Tensor, KX, KY, model: nn.Module, score_f:C
     E = model.forward()
 
 
-class LocalOptimization_LMA:
-    """
-    Optimize sum of squared residuals, non-linearly dependent on the geometric model, non-linearly parameterized
-    """
-    def __init__(self, N:int, model:nn.Module, residual_f:Callable, score_f:Callable=None, weight_f: Callable = None, damping_mult=1):
-        """
-        N -- number of points
-        residual_f(EE) --- should return [N] residuals, one per data point, provided essential matrix E, expanded to N copies as [N, 3, 3]
-        model --- nn.module with forward defining essential matrx of shape [3, 3]
-        score_f and weight_f will be needed in case of optimizing the robust version of the loss
-            score_f --- computes the robust score
-            weight_f --- computes probabilities of points being inliers
-        """
-        def default_score(rr):
-            return rr**2
-        
-        def default_weight(rr):
-            return torch.ones_like(rr)
-
-        self.residual_f = residual_f
-        self.score_f = score_f if score_f is not None else default_score
-        self.weight_f = weight_f  if weight_f is not None else default_weight
-        self.damping_mult = damping_mult
-        self.model = model
-        self.N = N
-        self.s = None # current best score
-        self.rr = None
-        self.p = None # model params copy
-
-    def compute_residuals_and_scores(self, E):
-        # separate copy per point to compute separate gradient
-        EE = unsqueeze_expand(E, -3, self.N)  # [*, N, 3, 3]
-        rr = self.residual_f(EE)
-        s = self.score_f(rr).sum(dim=-1)  # [*]
-        return EE, rr, s 
-
-    def iteration(self):
-        # evaluate score
-        """
-        return:
-        current model E [3, 3], current score
-        """
-        N = self.N
-        
-        if self.s is None:
-            E = self.model.forward()
-            EE, rr, self.s = self.compute_residuals_and_scores(E)
-            self.p = self.model.param.clone()
-        else:
-            EE = self.EE
-            rr = self.rr
-        """
-        GN rquires a single parameter vector, otherwise we cannot do JJ' and solve
-        Our quality is
-        Q(x) = \sum_i f_i(x)^2
-        Linearizing f(x + dx) = f(x) + J dx
-        J = df_i/ d x_j
-        Q(x + dx) = \sum_i (f_i + J_i dx)^2 = sim_i f_i^2 + 2*f_i*J_i dx + (J_i dx)^2
-        = 2*f'J dx + dx' J'J dx
-        maximize:
-        0 = 2*f'J + 2* dx'J'J
-        0 = J'f + J'Jdx
-        dx = -(J'J)^{-1} J'f
-        """
-        with torch.no_grad():
-            weight = self.weight_f(rr)
-        rr = rr /1000 # just to fix the scale for regularization
-        J1 = torch.autograd.grad(rr.sum(), EE, retain_graph=True)[0]  # [*, N, 3, 3] -- Gradient of all residuals in E
-        assert (not J1.isnan().any())
-        J1 = J1.flatten(start_dim=-2)  # [*, N, 9]
-        # Jacobian of E in model parameters
-        J2 = self.model.Jacobian()  # [9, *, 7]
-        assert (not J2.isnan().any())
-        with torch.no_grad():
-            # apply it on J1
-            J = torch.einsum('i...j, ...ni -> ...nj', J2, J1)  # [*, N, d], d = 7 -- marameters dimension
-            # compose JJ'
-            G = torch.einsum('...ni, ...nj,...n -> ...ij', J, J, weight)  # [*, d, d]
-            # compute J f
-            b = torch.einsum('...ni, ...n, ...n -> ...i', J, rr, weight)  # [*, d]            
-        while True:
-            # try with current damping, until get an improvmeent
-            m = self.damping_mult                
-            GD = G.clone()
-            # damping (we have a non-minimal parameterization)
-            GDdiag = torch.diagonal(GD, dim1=-1, dim2=-2) ## a view of the diagonal
-            GDdiag[:] = GDdiag[:]*(1+1e-4*m) + 1e-3*m    
-            # solve for next parameter
-            p_delta = torch.linalg.solve(G, b)
-            # step, maximization
-            self.model.param.data -= p_delta
-            # check improvement
-            new_E = self.model.forward() # current model
-            new_EE, new_rr, new_s = self.compute_residuals_and_scores(new_E)
-            if new_s < self.s0: # did not improve over s0, backtrack:
-                self.model.param.data = self.p
-                self.damping_mult *= 3 # more damping
-            else: # successfully improved
-                self.damping_mult *= 1.5 # less damping                
-                # s has improved, remember as current best
-                self.s = new_s.detach().clone()
-                self.p = self.model.param.clone()
-                self.EE = new_EE
-                self.rr = new_rr
-                return new_E, new_s
-
-
 class LocalOptimization_GGN:
     """
     Generalized Gauss Newton
@@ -420,6 +318,7 @@ class LocalOptimization_GGN:
             ff = self.ff
             ww = self.ww
         J2 = self.model.Jacobian()  # [9, *, 7]
+        
         J1 = torch.autograd.grad(ff.sum(), EE, retain_graph=True)[0]  # [*, N, 3, 3] -- Gradient of all residuals in E
         J1 = J1.flatten(start_dim=-2)  # [*, N, 9]
         #
@@ -454,7 +353,7 @@ class LocalOptimization_GGN:
                 print('<', end='')
             else: # successfully improved
                 print('>', end='')
-                self.damping_mult *= 1.5 # less damping
+                self.damping_mult /= 1.5 # less damping
                 # s has improved, remember as current best
                 self.loss = new_loss # keep it differentiable
                 self.EE = new_EE
@@ -465,6 +364,86 @@ class LocalOptimization_GGN:
         raise StopIteration #converged
 
 
+
+class LocalOptimization_GGN_Batch:
+    """
+    Generalized Gauss Newton
+    """
+    def __init__(self, model:nn.Module, loss_f:Callable, damping_mult=1e-5, max_iterations=50):
+        """
+        N -- number of points
+        loss_f(EE) --- loss to miminize, see example below
+        model --- nn.module with forward defining essential matrx of shape [3, 3]
+        """
+        self.loss_f = loss_f
+        self.max_iterations = max_iterations
+        self.model = model
+        #
+        with torch.no_grad():
+            E = self.model.forward() # [...,3,3]
+            self.loss, EE, ff, ww  = self.loss_f(E)# [...], [..., N, 3, 3], [..., N], [..., N]
+            self.N = ff.shape[-1]
+            B = self.loss.shape #
+            self.damping_mult = self.loss.new_ones(B)*damping_mult
+
+    def __iter__(self):
+        self.iteration = 0
+        return self
+
+    def __next__(self):
+        """
+        return:
+        current model E [3, 3], current loss
+        """
+        if self.iteration >= self.max_iterations:
+            raise StopIteration
+        N = self.N
+
+        E = self.model.forward() # [...,3,3]
+        self.loss, EE, ff, ww  = self.loss_f(E)# [...], [..., N, 3, 3], [..., N], [..., N]
+
+        J2 = self.model.Jacobian()  # [9, *, 7]
+        
+        J1 = torch.autograd.grad(ff.sum(), EE, retain_graph=True)[0]  # [*, N, 3, 3] -- Gradient of all residuals in E
+        J1 = J1.flatten(start_dim=-2)  # [*, N, 9]
+        #
+        self.model.param.grad = None
+        self.loss.sum().backward()
+        # Jacobian of E in model parameters
+        # compute sum_i w_i J1_i J1_i.T
+        G = torch.einsum('...ni, ...nj,...n -> ...ij', J1, J1, 1/ww)*2  # [*, 9, 9]
+        # compute J2 G J2.T: sum_jk J2_{i...j} G_{i...k} J2_{k...l}
+        G = torch.einsum('i...j, ...ik, k...l -> ...jl', J2, G, J2)  # [*, d, d], d = 7 -- marameters dimension
+        # gradient:
+        g = self.model.param.grad # [*, d]
+        p0 = self.model.param.clone() # [d]
+        # try with current damping, until get an improvmeent
+        m = self.damping_mult.unsqueeze(-1)*N
+        # damping (we have a non-minimal parameterization)
+        Gdiag = torch.diagonal(G, dim1=-1, dim2=-2) ## a view of the diagonal
+        Gdiag[:] = Gdiag[:]*(1+1e-4*m) + 1e-3*m
+        p_delta = -torch.linalg.solve(G, g)
+        # step, to that critical point
+        self.model.param.data = p0 + p_delta.squeeze(0)
+        # check improvement
+        with torch.no_grad():
+            new_E = self.model.forward() # current model
+            new_loss, new_EE, new_ff, new_ww  = self.loss_f(new_E)
+
+            self.loss = self.loss.detach()
+            # models to backtrack
+            mask_backtrack = new_loss >= self.loss # [B]
+            self.model.param.data[mask_backtrack] = p0[mask_backtrack]
+            self.damping_mult[mask_backtrack] *= 3 # more damping
+            # models to accept
+            mask_accept = torch.logical_not(mask_backtrack)
+            self.damping_mult[mask_accept] /= 1.5 # more damping
+            self.loss[mask_accept] = new_loss[mask_accept]
+            E[mask_accept] = new_E[mask_accept]
+
+        self.iteration += 1
+        return E, self.loss
+ 
 if __run__:
     torch.manual_seed(0)
     E = torch.rand(3,3, dtype= torch.float64)
@@ -487,26 +466,29 @@ if __run__:
 
     def test_loss(E):
          # algebraic error
-        EE = unsqueeze_expand(E, -3, N)  # [N, 3, 3]        
+        EE = unsqueeze_expand(E, -3, N)  # [...,N, 3, 3]
         ff = torch.einsum('ni,nj,...nij->...n', Y,X, EE)
-        ww =  torch.ones(N).to(ff)
-        c = torch.zeros(N).to(ff)
+        ww =  torch.ones(ff.shape).to(ff)
+        c = torch.zeros(ff.shape).to(ff)
         losses = ff**2 / ww + c
         return losses.sum(dim=-1), EE, ff, ww
     
     def loss():
         E = model.forward()
         ll , _, _, _ = test_loss(E)
-        return ll.sum()
+        return ll.sum(dim=-1)
 
     print('Loss at GT:', loss().item())
-    model = E_parameterization(E + torch.rand(3,3, dtype= torch.float64)*0.2)
+    # single model
+    # model = E_parameterization(E + torch.rand(3,3, dtype= torch.float64)*0.2)
+    # batch of models
+    model = E_parameterization(E.unsqueeze(0) + torch.rand([5, 3, 3], dtype= torch.float64)*0.2)
     print('Loss at perturbed init:', loss().item())
 
     print('GGN')
-    GGN = LocalOptimization_GGN(N,model, test_loss, damping_mult=1e-5)
+    GGN = LocalOptimization_GGN_Batch(model, test_loss, damping_mult=1e-5, max_iterations=10)
     for it, (E, l) in enumerate(GGN):
-        print(it, l.item())
+        print(it, l)
 
     # print('================')
     # print('SGD test')
