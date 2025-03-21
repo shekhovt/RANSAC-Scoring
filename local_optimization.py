@@ -1,3 +1,5 @@
+# %% 
+
 import os, sys
 if  __name__ == "__main__":
     __name__ = 'score_learn.local_optimization'
@@ -7,6 +9,7 @@ if  __name__ == "__main__":
     dname = os.path.dirname(abspath)
     os.chdir(dname)
     sys.path.append(os.path.dirname(dname))
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
 else:
     __run__ = False
 
@@ -21,7 +24,7 @@ import kornia
 
 from .functional import *
 
-
+# %% 
 def SampsonELO(x, y, KX, KY, E) -> Tensor:
     """
     x,y [*, N, 3] -- normalized point coordinates
@@ -58,15 +61,16 @@ class E_parameterization:
         super().__init__()
         # decompose E into R,t, hopefully works in batches
         self.E0 = E
-        R1, _, t = kornia.geometry.epipolar.decompose_essential_matrix(E)
+        R1, R2, t = kornia.geometry.epipolar.decompose_essential_matrix(E)
         self.bs = list(E.shape)[:-2]  # batch shape
         if self.bs == []:
             R1 = R1.squeeze(0)
         # 6 parameters per essential matrix
         self.param = E.new_zeros(self.bs + [7], dtype=torch.float64)
         self.param.requires_grad = True
-        self.t = t.squeeze(-1)  # set translation        
-        self.R = R1.to(self.param)  # any is good
+        self.t = F.normalize(t.squeeze(-1), dim=-1)  # set translation
+        
+        self.R0 = R1.to(self.param)  # any is good
         # rotatino is modelled incrementally to R
         # set quaternion to [1,0,0,0] -- identity rotation
         self.q.data[..., 0] = 1
@@ -75,6 +79,7 @@ class E_parameterization:
 
     @property
     def t(self):
+        # return torch.tensor((0,0,1),dtype = torch.float64) # DEBUG
         return self.param[..., 0:3]
 
     @t.setter
@@ -85,20 +90,41 @@ class E_parameterization:
     def q(self):
         return self.param[..., 3:]
 
-    # @q.setter
-    # def q(self, v):
-        # self.param.data[..., 3:] = v
+    @q.setter
+    def q(self, v):
+        self.param.data[..., 3:] = v
 
-    def forward(self):
-        t = F.normalize(self.t, dim=-1) # translation vector is up to global scale
+    @property
+    def R(self):
         q = F.normalize(self.q, dim=-1) # quaternion vector must be normalized
         dR = kornia.geometry.conversions.quaternion_to_rotation_matrix(q)
         # batched matrix multiplication
-        R = torch.einsum('...ij, ...jk -> ...ik', self.R, dR)
+        R = torch.einsum('...ij, ...jk -> ...ik', self.R0, dR)
+        return R
+    
+    @R.setter
+    def R(self, R):
+        self.R0.data = R
+        self.q.data.fill_(0)
+        self.q.data[..., 0] = 1
+
+    def forward(self):
+        # t = F.normalize(self.t, dim=-1) # translation vector is up to global scale
+        t =  self.t # do not normalize, intentinally
+        R = self.R
         E = compose_essential_matrix(R, t)
         return E
+    
+    def step(self, deltap):
+        self.param.data += deltap
+        # debug: freeze dR
+        # self.q.data.fill_(0)
+        # self.q.data[..., 0] = 1
+        self.q = F.normalize(self.q, dim=-1)
+        self.t = F.normalize(self.t, dim=-1)
+        # self.t = torch.tensor((0,0,1),dtype = torch.float64) # DEBUG
 
-    @torch.compile(dynamic = True, backend = "inductor", mode="reduce-overhead")
+    # @torch.compile(dynamic = True, backend = "inductor", mode="reduce-overhead")
     def Jacobian(self):
         def func(param):
             p = self.param
@@ -353,6 +379,10 @@ class LocalOptimization_GGN:
 class LocalOptimization_GGN_Batch:
     """
     Generalized Gauss Newton
+    description: https://snip.mathpix.com/shekhovtsov/notes/ggn2-b7885cd3-c709-4964-9e67-60abdd32a3ba
+    See also for GGN: 
+    Martens (2017) New Insights and Perspectives on the Natural Gradient Method
+    Schraudolph (2002) Fast Curvature Matrix-Vector Products for Second-Order Gradient Descent
     """
     def __init__(self, model:nn.Module, loss_f:Callable, damping_mult=1e-5, max_iterations=50):
         """
@@ -398,9 +428,9 @@ class LocalOptimization_GGN_Batch:
         self.loss.sum().backward()
         # Jacobian of E in model parameters
         # compute sum_i w_i J1_i J1_i.T
-        G = torch.einsum('...ni, ...nj,...n -> ...ij', J1, J1, 1/ww)*2  # [*, 9, 9]
+        G = torch.einsum('...ni, ...nj,...n -> ...ij', J1, J1, 1/ww.detach())  # [*, 9, 9]
         # compute J2 G J2.T: sum_jk J2_{i...j} G_{i...k} J2_{k...l}
-        G = torch.einsum('i...j, ...ik, k...l -> ...jl', J2, G, J2)  # [*, d, d], d = 7 -- marameters dimension
+        G = torch.einsum('i...j, ...ik, k...l -> ...jl', J2, G, J2) * 2 # [*, d, d], d = 7 -- parameters dimension
         # gradient:
         g = self.model.param.grad # [*, d]
         p0 = self.model.param.clone() # [d]
@@ -411,7 +441,8 @@ class LocalOptimization_GGN_Batch:
         Gdiag[:] = Gdiag[:]*(1+1e-4*m) + 1e-3*m
         p_delta = -torch.linalg.solve(G, g)
         # step, to that critical point
-        self.model.param.data = p0 + p_delta.squeeze(0)
+        # self.model.param.data = p0 + p_delta.squeeze(0)
+        self.model.step(p_delta.squeeze(0))
         # check improvement
         with torch.no_grad():
             new_E = self.model.forward() # current model
@@ -430,24 +461,66 @@ class LocalOptimization_GGN_Batch:
 
         self.iteration += 1
         return E, self.loss
- 
+# %%
+def rotation_matrix_y(angle_rad):
+  """
+  Creates a rotation matrix around the y-axis in PyTorch.
+
+  Args:
+    angle_rad: The rotation angle in radians.
+
+  Returns:
+    A 3x3 rotation matrix as a PyTorch tensor.
+  """
+  cos_theta = torch.cos(angle_rad)
+  sin_theta = torch.sin(angle_rad)
+
+  rotation_matrix = torch.tensor([
+      [cos_theta, 0, sin_theta],
+      [0, 1, 0],
+      [-sin_theta, 0, cos_theta]
+  ])
+
+  return rotation_matrix
+
+
+# %%
 if __run__:
-    torch.manual_seed(0)
-    E = torch.rand(3,3, dtype= torch.float64)
-    R, _, t = kornia.geometry.epipolar.decompose_essential_matrix(E)
+    torch.manual_seed(1)
+    # Example usage:
+    angle_degrees = 10
+    angle_radians = torch.deg2rad(torch.tensor(angle_degrees))
+    R = rotation_matrix_y(angle_radians).to(torch.float64)
+    t = torch.ones(3, dtype = torch.float64)
+    E = compose_essential_matrix(R, t)
+    # E = torch.rand(3,3, dtype= torch.float64)
+    R, R2, t = kornia.geometry.epipolar.decompose_essential_matrix(E)
     t = t.squeeze(-1)
     R = R.squeeze(0)
-    E = compose_essential_matrix(R, t)
-    N = 100
-    X = torch.cat([torch.rand(N,2, dtype= torch.float64), torch.ones(N,1, dtype= torch.float64)], dim=-1) # [N 3]
-    Y = (X) @ R.T - t
+    R2 = R2.squeeze(0)
+    E = compose_essential_matrix(R, -t)
+    print(E.trace())
+    # E1 = compose_essential_matrix(R2, t)
+    # print(E / E1)
+    # N = 20
+    a_values = torch.linspace(-1, 1, 100)
+    b_values = torch.linspace(-1, 1, 100)
+    a, b = torch.meshgrid(a_values, b_values)
+    X = torch.stack([a,b, torch.ones(a.shape, dtype= torch.float64)], dim=-1)
+
+    # X = torch.cat([torch.randn(N,2, dtype= torch.float64), torch.ones(N,1, dtype= torch.float64)], dim=-1) # [N 3]
+    # Y = (X) @ R.T - t
+    # test pure rotation
+    Y = (X) @ R.T # if we use R here, then R2 is not the other GT solution
+    # Y = Y / Y[:, 2:]
     # X and Y are noise-free forrespondences
     # check they satisfy epipolar constraint:
-    f = torch.einsum('ni,ij,nj->n',Y, E, X)
+    f = torch.einsum('...i,ij,...j->...',Y, E, X)
     assert((f.abs() < 1e-6).all())
 
-    # X = X + torch.rand(X.shape, dtype=X.dtype)*0.001
-    # Y = Y + torch.rand(X.shape, dtype=Y.dtype)*0.001
+    Xn = (X + torch.rand(X.shape, dtype=X.dtype)*0.000).view([-1, 3])
+    Yn = (Y + torch.rand(X.shape, dtype=Y.dtype)*0.000).view([-1, 3])
+    N = Xn.shape[0]
 
     model = E_parameterization(E)
 
@@ -456,8 +529,17 @@ if __run__:
         EE = unsqueeze_expand(E, -3, N)  # [...,N, 3, 3]
         # if E.requires_grad:
             # EE.retain_grad()
-        ff = torch.einsum('ni,nj,...nij->...n', Y,X, EE)
-        ww =  torch.ones(ff.shape).to(ff)
+        yE = torch.einsum('...i, ...ij -> ...j', Yn, EE)  # [*, N, 3]
+        Ex = torch.einsum('...j, ...ij -> ...i', Xn, EE)  # [*, N, 3]
+        numerator = torch.einsum('...i, ...i', yE, Xn) # [*, N]
+        denom = (((yE[..., 0:2])**2 + (Ex[..., 0:2])** 2).sum(dim=-1))**0.5  # [*, N]
+        if False: # option 1: denominator differentiated
+            ff = numerator/denom  # [*, N]
+            ww =  torch.ones(ff.shape).to(ff)
+        else: # option 2: denominator not differentiated
+            ff = numerator
+            ww = (denom**2).detach()
+        # ff = torch.einsum('ni,nj,...nij->...n', Yn, Xn, EE) # algebraic error
         c = torch.zeros(ff.shape).to(ff)
         losses = ff**2 / ww + c
         return losses.sum(dim=-1), EE, ff, ww
@@ -469,21 +551,70 @@ if __run__:
 
     print('Loss at GT:', loss().item())
     # single model
-    # model = E_parameterization(E + torch.rand(3,3, dtype= torch.float64)*0.2)
+    batched = False
+    torch.manual_seed(4)
+    E_start  = E + torch.rand(3,3, dtype= torch.float64)*0.2
+    U,S,V = torch.linalg.svd(E_start)
+    S[:] = torch.tensor((1,1,0))
+    E_start = U @ torch.diag(S) @ V
+    model = E_parameterization(E_start)
     # batch of models
-    model = E_parameterization(E.unsqueeze(0) + torch.rand([5, 3, 3], dtype= torch.float64)*0.2)
+    # model = E_parameterization(E.unsqueeze(0) + torch.rand([5, 3, 3], dtype= torch.float64)*0.2)
     print('Loss at perturbed init:', loss().item())
 
     print('GGN')
+    from .metrics import R_error
     GGN = LocalOptimization_GGN_Batch(model, test_loss, damping_mult=1e-5, max_iterations=10)
     for it, (E, l) in enumerate(GGN):
-        print(it, l)
+        Rm = model.R
+        # rot_err = torch.min(R_error(Rm, R), R_error(Rm, R2)).item()
+        rot_err = R_error(Rm, R)
+        print(it, f'loss = {l.item()}, rot err = {rot_err:4.3f} deg')
+    # model.R = R
+    # print('Loss at GT R:', loss().item())
+    # relative rotation:
+    rR = R @ Rm.T
+    v = TR.from_matrix(rR.detach()).as_rotvec()
+    print("relative rot = ", v / np.linalg.norm(v))
+    # 
+    Y1 = X @ Rm.T
+    t = model.t
+    print(t)
+    Tx = kornia.geometry.epipolar.cross_product_matrix(t)
+    mixprod = torch.einsum('...i,...j,ij->...', Y, Y1, Tx) # algebraic error
+    print(mixprod.abs().max())
 
+    from scipy.spatial.transform import Rotation as TR
+    import numpy as np
+    vR = TR.from_matrix(R.detach()).as_rotvec()
+    print("GT rotvect 1 = ", vR / np.linalg.norm(vR))
+    # vR = TR.from_matrix(R2.detach()).as_rotvec()
+    # print("GT rotvect 2 = ", vR / np.linalg.norm(vR))
+    v = TR.from_matrix(Rm.detach()).as_rotvec()
+    print("found rotvect = ", v / np.linalg.norm(v))
+
+
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
+
+    fig = plt.figure(figsize=(10, 7))
+    ax = fig.add_subplot(111, projection='3d')
+
+    w = torch.linalg.cross(Y, Y1).detach().numpy()
+    ax.plot_surface(w[:,:,0], w[:,:,1], w[:,:,2], cmap='viridis', edgecolor='none')
+    ax.set_title('Manifold of the Cross Product of u and v')
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+
+    plt.show()
+
+    
     # print('================')
     # print('SGD test')
-    # # opt = torch.optim.Adam([model.param], lr=1e-3, betas = (0.0,0.99))
+    # opt = torch.optim.Adam([model.param], lr=1e-3, betas = (0.0,0.99))
     # opt = torch.optim.SGD([model.param], lr=1e-4, momentum=0.0)
-    # for it in range(20000):
+    # for it in range(2000):
     #     opt.zero_grad()
     #     l = loss()
     #     l.backward()
@@ -491,7 +622,15 @@ if __run__:
     #     if it %100 == 0:
     #         print(l.item())
 
+    # Rm = model.R
+    # rot_err = torch.min(R_error(Rm, R), R_error(Rm, R2)).item()
+    # print(it, f'loss = {l.item()}, rot err = {rot_err:4.3f} deg')
+
     # print('GGN')
-    # GGN = LocalOptimization_GGN(N,model, test_loss, damping_mult=1e-3)
+    # # GGN = LocalOptimization_GGN(N,model, test_loss, damping_mult=1e-3)
+    # GGN = LocalOptimization_GGN_Batch(model, test_loss, damping_mult=1e-5, max_iterations=10)
     # for it, (E, l) in enumerate(GGN):
-    #     print(it, l.item())
+    #     Rm = model.R
+    #     rot_err = torch.min(R_error(Rm, R), R_error(Rm, R2)).item()
+    #     print(it, f'loss = {l.item()}, rot err = {rot_err:4.3f} deg')
+# %%
