@@ -525,10 +525,8 @@ if __run__:
     model = E_parameterization(E)
 
     def test_loss(E:Tensor):
-         # algebraic error
         EE = unsqueeze_expand(E, -3, N)  # [...,N, 3, 3]
-        # if E.requires_grad:
-            # EE.retain_grad()
+        # Sampson Error
         yE = torch.einsum('...i, ...ij -> ...j', Yn, EE)  # [*, N, 3]
         Ex = torch.einsum('...j, ...ij -> ...i', Xn, EE)  # [*, N, 3]
         numerator = torch.einsum('...i, ...i', yE, Xn) # [*, N]
