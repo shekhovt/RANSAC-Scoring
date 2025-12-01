@@ -1,0 +1,6 @@
+[submodule "external/PoseLib"]
+	path = external/PoseLib
+	url = https://github.com/vlarsson/PoseLib.git
+[submodule "external/homography-benchmark"]
+	path = external/homography-benchmark
+	url = git@github.com:danini/homography-benchmark.git
