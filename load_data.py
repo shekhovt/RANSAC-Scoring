@@ -1,3 +1,4 @@
+#%%
 import os
 import sys
 if __name__ == "__main__":
@@ -21,6 +22,7 @@ import torch.utils.data as data
 import copy
 import h5py
 import numpy as np
+import yaml
 
 from  .tools import *
 from  .score_weights import *
@@ -47,18 +49,18 @@ test = [
     ]
 ,
 val = [
-    'buckingham_palace',
-    'brandenburg_gate',
-    'colosseum_exterior',
-    'grand_place_brussels',
-    'notre_dame_front_facade',
-    'palace_of_westminster',
-    'pantheon_exterior',
-    'prague_old_town_square',
+    'buckingham_palace', # 0
+    'brandenburg_gate', # 1
+    'colosseum_exterior', # 2
+    'grand_place_brussels', # 3 
+    'notre_dame_front_facade', # 4
+    'palace_of_westminster', # 5
+    'pantheon_exterior', # 6
+    'prague_old_town_square', # 7
     # 'sacre_coeur',
-    'taj_mahal',
-    'trevi_fountain',
-    'westminster_abbey'
+    'taj_mahal', # 8
+    'trevi_fountain', # 9
+    'westminster_abbey' # 10
     
 ],
 train = ['st_peters_square']
@@ -105,6 +107,15 @@ KITTI = dotdict(
     root='/home/shekhole/data/KITTI/', #'/home/weitong/code/differentiable_ransac_private/saved_residuals/KITTI/',
     RT_path_train = '/mnt/personal/weitong/RootSIFT_features/KITTI/train_data_rs/', # where do we get KITTI R,t ground truth?
     RT_path_test = '/mnt/personal/weitong/RootSIFT_features/KITTI/test_data_rs/',
+    test=['test'],
+    val=['train'],
+    train=['train'],
+)
+
+ScanNet = dotdict(
+    name='ScanNet',
+    Fundamental=False,
+    root='/home/weitong/code/differentiable_ransac_private/saved_residuals/scannet/',
     test=['test'],
     val=['train'],
     train=['train'],
@@ -452,6 +463,178 @@ def test_loader(loader):
     # C = np.unique(C)
     # print(C)
 
+
+HEB = dotdict(
+    name='HEB',
+    type='homography',
+    root='./data/HEBHomographyDataset/',
+    RT_path_train='./data/HEBHomographyDataset/training_and_validation',
+    RT_path_test='./data/HEBHomographyDataset/test/',
+test = [
+    'Ellis_Island',
+    'Piazza_del_Popolo'
+    'Tower_of_London',
+    'Vienna_Cathedral',
+    'Madrid_Metropolis',
+    'Roman_Forum',
+    'Union_Square',
+    'Yorkminster'
+    ]
+,
+val = [
+    'Alamo',
+    'NYC_Library'
+]    
+)
+
+def load_h5(filename):
+    '''Loads dictionary from hdf5 file'''
+    dict_to_load = {}
+    with h5py.File(filename, 'r') as f:
+        keys = [key for key in f.keys()]
+        for key in keys:
+            dict_to_load[key] = f[key][()]
+    return dict_to_load
+
+class H_dataset(data.Dataset):
+    def __init__(self, dataset_info, scene, padding=False, size=3000) -> None:
+        self.padding = padding
+        self.size = size
+        config_path = dataset_info.root + '/dataset_configuration.yaml'
+        # Loading the configuration file
+        with open(config_path, "r") as stream:
+            try:
+                configuration = yaml.safe_load(stream)
+            except yaml.YAMLError as exc:
+                print(exc)
+                exit()
+        
+        scene_f = None
+        for s in configuration['TEST_SCENES'] + configuration['TRAIN_SCENES']:
+            if scene == s['name']:
+                scene_scale = s['scale']
+                scene_f = s['filename']
+                if s in configuration['TEST_SCENES']:
+                    root = dataset_info.RT_path_test
+                else:
+                    root = dataset_info.RT_path_train
+
+        if scene_f is None:
+            raise RuntimeError()
+
+        source_path = os.path.join(root, scene_f)
+        target_path = mirror(source_path)
+        self.padding = padding
+        self.size = size # IDK
+        self.Data = None
+        self.src = target_path
+        self.kind = 'homography'
+        self.scene_scale = scene_scale
+        self.scene = scene
+        # Add SNN_filter?
+        # select a subset of image pairs?
+        file = self.src + '_compressed.pkl'
+
+        if os.path.exists(file):
+            print('Loaded compressed data')
+            self.Data = load_object(file)
+            self.files = self.Data.meta.files
+        else:
+            print('Compressing')
+            self.Data = self.compress()
+            save_object(file, self.Data)
+            print('compressed size: ' + str(os.path.getsize(file) / 1024/1024) + ' Mb')
+
+    def compress(self):
+        padding = self.padding
+        self.padding = False
+        Data = SimpleNamespace()
+        Data.meta = SimpleNamespace()
+        Data.data = []
+        cmax = 0
+        # fetch "files" -- number of pairs in the dataset
+        print(f"Loading scene '{self.scene}'")
+        print(f"The scene scale is {self.scene_scale}")
+        self.data = load_h5(self.src)
+        self.files = sorted([x.replace('corr_','') for x in self.data.keys() if x.startswith('corr_')])
+        Data.meta.files = self.files
+        Data.meta.scale = self.scene_scale
+        print(f"Number of pairs: {len(self.files)}")
+        #
+        for i in range(len(self)):
+            data = self[i]
+            Data.data.append(data)
+            cmax = np.maximum(np.nan_to_num(cmax), data['correspondences'].shape[0]) 
+        #  
+        print(f'cmax: {cmax}')
+        Data.meta.cmax = cmax
+        Data.meta.len = len(Data.data)
+        self.padding = padding
+        return Data
+
+    def __len__(self):
+        if self.Data is not None:
+            return self.Data.meta.len
+        else:
+            return len(self.files)
+        
+    def padd_data(self, data):
+        N = self.Data.meta.cmax
+        C = data['correspondences']
+        C = np.concatenate((C, np.full((max(0, N - C.shape[0]), C.shape[1]), np.float32(np.inf))), axis=0)
+        data['correspondences'] = C
+
+    def __getitem__load(self, index):
+        p = self.files[index]
+        data = self.data
+        corr = data[f'corr_{p}'] # The SIFT unnormalized correspondences [num_pts x 10]: [X1, Y1, X2, Y2, angle1, angle2, scale1, scale2, snn_ratio, is_inlier_gt]
+        pose = data[f'pose_{p}'] # The ground truth relative pose coming from the COLMAP reconstruction, 3x4 matrix ?
+        size1 = data[f"size_{ '_'.join(p.split('_')[0:3]) }"] # The size of the source image
+        size2 = data[f"size_{ '_'.join(p.split('_')[3:6]) }"] # The size of the destination image
+        K1 = data[f"K_{ '_'.join(p.split('_')[0:3]) }"] # The intrinsic matrix of the source image 3x3, single focal length, principle point at size/2
+        K2 = data[f"K_{ '_'.join(p.split('_')[3:6]) }"]        
+        num_pts = corr.shape[0]
+        r = {
+            'correspondences': corr,
+            'K1': K1,
+            'K2': K2,
+            'size1': size1,
+            'size2': size2,
+            'num_pts': num_pts,
+            'files': p,
+            'GT': pose,
+        }
+        return r
+
+    def __getitem__(self, index):
+        if self.Data is not None:
+            data = copy.deepcopy(self.Data.data[index])
+            # normalize correspondences
+            C = torch.tensor(data['correspondences'])
+            x = torch.cat([C[..., :2], C.new_ones(list(C.shape[:-1]) + [1])], dim=-1)
+            y = torch.cat([C[..., 2:4], C.new_ones(list(C.shape[:-1]) + [1])], dim=-1)
+            K1 = torch.tensor(data['K1']) # [3, 3] -- paired with x
+            K2 = torch.tensor(data['K2']) # [3, 3] -- paired with y
+            K1I = K1.inverse()
+            K2I = K2.inverse()
+            x = torch.einsum('ij, nj -> ni', K1I, x)
+            y = torch.einsum('ij, nj -> ni', K2I, y)
+            x = x[:,0:2]/x[:,-1:]
+            y = y[:, 0:2]/y[:, -1:]
+            C = torch.cat([x,y], dim=-1)
+            data['correspondences'] = C.numpy()
+            # convert model H to normalized coordinates:
+            H = torch.tensor(data['GT'])
+            # TODO:
+            # E = torch.einsum('ij, mik, kl -> mjl', K2, F, K1)  # K2^{-T} F K1^{-1}
+            # data['models'] = E
+            self.padd_data(data)
+            data["is_H"] = True  # Homography flag
+            return data
+        else:
+            return self.__getitem__load(index)
+
+
 from types import SimpleNamespace
 
 
@@ -461,9 +644,17 @@ if __run__:
     os.chdir(dname)
     #
     # dataset_info = PhotoTourismRootSIFT
-    dataset_info = KITTI
-    src = 'test'
-    dataset = ResidualData(dataset_info, src, padding=True) # padding the 
-    loader = torch.utils.data.DataLoader(dataset, batch_size=32, num_workers=0, shuffle=False)
-    test_loader(loader)
+    if False:
+        dataset_info = KITTI
+        src = 'test'
+        dataset = ResidualData(dataset_info, src, padding=True) # padding the 
+        loader = torch.utils.data.DataLoader(dataset, batch_size=32, num_workers=0, shuffle=False)
+        test_loader(loader)
+    if True:
+        dataset_info = HEB
+        scene = 'Piazza_del_Popolo'
+        dataset = H_dataset(dataset_info, scene, padding=True)
+        loader = torch.utils.data.DataLoader(dataset, batch_size=32, num_workers=0, shuffle=False)
+        test_loader(loader)
     
+# %%

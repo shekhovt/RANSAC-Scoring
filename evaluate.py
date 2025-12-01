@@ -1,4 +1,5 @@
-# translation rotation# %%
+# translation rotation
+# %%
 import os, sys
 if __name__ == "__main__":   
     __name__ = 'score_learn.evaluate.py'
@@ -64,12 +65,13 @@ ops, args = op.parse_known_args(shlex.split(args_str))
 o = SimpleNamespace(**vars(ops))
 ## 
 ## For interactove model
-# o.validate = True
+o.validate = True
 # o.F = True
 # o.geom = True
 # o.inliers = True
 # o.R = True
-o.var = True
+# o.var = True
+o.var = False
 ##
 ##
 
@@ -104,9 +106,9 @@ o.F = (dataset_info.Fundamental or o.F)
 
 Eval_GCMAGSAC = False
 
-val_scenes = dataset_info.val
+# val_scenes = dataset_info.val
 # val_scenes = dataset_info.test
-# val_scenes = dataset_info.val[0:3]
+val_scenes = dataset_info.val[3:4]
 # test_scenes = dataset_info.test #[7:8]
 test_scenes = dataset_info.test
 res_root = f'results/{dataset_info.name}/'
@@ -990,7 +992,7 @@ for file in files:
     W = None
     f = os.path.abspath(os.path.join(model_path, file))
     if file.endswith(".pkl"):
-        W = torch.load(f)
+        W = torch.load(f, weights_only=False)
         # if isinstance(W, ScoreWeightsMonotoneMix):
             # continue
         if isinstance(W, ScoreWeightsTZ):
@@ -1199,7 +1201,8 @@ if validate:
             ax = ax1
                 # continue
             has_hyperparam = hasattr(W, 'set_hyperparam') and not (hasattr(W, 'locked') and W.locked)
-            for err_key in ['best_r', 'best_e']:
+            # for err_key in ['best_r', 'best_e']:
+            for err_key in ['best_e']:
                 v = np.array(stat(getattr(W,err_key).T, axis=-1))
                 v = v.reshape(v.size)
                 v_besti = np.argmin(v)
@@ -1277,6 +1280,7 @@ if validate:
     # assert(False)
 #%%
 if validate:
+    print('Plotting validation kernels')
     plt.figure()
     for (i,W) in enumerate(methods):
         if hasattr(W, 'locked'):
@@ -1301,6 +1305,7 @@ if validate:
     # plt.title('Selected kernels')
     # plt.xlim(0,7)
     plt.xlabel('Residual [px]')
+    plt.show()
     plt.draw()
     force_path(fig_path)
     savefig(fig_path + f'validation_kernels.pdf')

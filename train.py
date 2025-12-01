@@ -51,7 +51,7 @@ op.add_argument("--sqrt", action="store_true", default=True, help="take square r
 #op.add_argument("-F", action="store_true", default=False, help="Fundamental matrix case, no extra scaling")
 
 # RootSIFT
-# op.add_argument("--data", type=str, default='PhotoTourismRootSIFT', help="dataset")
+op.add_argument("--data", type=str, default='PhotoTourismRootSIFT', help="dataset")
 # SP+SG
 # op.add_argument("--data", type=str, default='PhotoTourismSPSG', help="dataset")
 
@@ -65,8 +65,8 @@ op.add_argument("--sqrt", action="store_true", default=True, help="take square r
 # #
 
 # # KITTI setup
-op.set_defaults(batch_size=8)
-op.add_argument("--data", type=str, default="KITTI", help="dataset")
+# op.set_defaults(batch_size=8)
+# op.add_argument("--data", type=str, default="KITTI", help="dataset")
 
 #
 # python score_weights_script.py -l logreg --reg 0.0 --N_bins 200 --max_batches=2 --epochs 100 --lr 0.5 --load
