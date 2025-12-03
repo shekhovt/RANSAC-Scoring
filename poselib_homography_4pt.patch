@@ -1,0 +1,32 @@
+diff --git a/pybind/pyposelib.cc b/pybind/pyposelib.cc
+index 469c2d7..fc66fb2 100644
+--- a/pybind/pyposelib.cc
++++ b/pybind/pyposelib.cc
+@@ -201,6 +201,17 @@ Eigen::Matrix3d essential_matrix_8pt_wrapper(const std::vector<Eigen::Vector3d>
+     return essential_matrix;
+ }
+ 
++std::optional<Eigen::Matrix3d> homography_4pt_wrapper(const std::vector<Eigen::Vector3d> &x1,
++                                                       const std::vector<Eigen::Vector3d> &x2,
++                                                       bool check_cheirality = true) {
++    Eigen::Matrix3d H;
++    int sols = homography_4pt(x1, x2, &H, check_cheirality);
++    if (sols > 0) {
++        return H;
++    }
++    return std::nullopt;
++}
++
+ std::vector<CameraPose> relpose_upright_3pt_wrapper(const std::vector<Eigen::Vector3d> &x1,
+                                                     const std::vector<Eigen::Vector3d> &x2) {
+     std::vector<CameraPose> output;
+@@ -1094,6 +1105,9 @@ PYBIND11_MODULE(poselib, m) {
+           py::call_guard<py::gil_scoped_release>());
+     m.def("essential_matrix_5pt", &poselib::essential_matrix_relpose_5pt_wrapper, py::arg("x1"), py::arg("x2"),
+           py::call_guard<py::gil_scoped_release>());
++    m.def("homography_4pt", &poselib::homography_4pt_wrapper, py::arg("x1"), py::arg("x2"),
++          py::arg("check_cheirality") = true, py::call_guard<py::gil_scoped_release>(),
++          "Compute homography from 4 point correspondences. Returns homography matrix if successful, None otherwise.");
+     m.def("shared_focal_relpose_6pt", &poselib::shared_focal_relpose_6pt_wrapper, py::arg("x1"), py::arg("x2"),
+           py::call_guard<py::gil_scoped_release>());
+     m.def("relpose_5pt", &poselib::relpose_5pt_wrapper, py::arg("x1"), py::arg("x2"),

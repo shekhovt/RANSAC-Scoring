@@ -1,9 +1,9 @@
 # %%
 import matplotlib.colors as mcolors
-from . import local_optimization as LO
+from .. import local_optimization as LO
 from .aro import ARO_candidates, pose_error_EE, pose_error_EERT
-from .load_data import *
-from .score_weights import *
+from ..load_data import *
+from ..score_weights import *
 from types import SimpleNamespace
 import os
 import sys

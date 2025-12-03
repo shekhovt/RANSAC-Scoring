@@ -27,6 +27,7 @@ import yaml
 from  .tools import *
 from  .score_weights import *
 from  .score_weights import SampsonM
+from .model_H import normalize_points
 
 PhotoTourismSPSG = dotdict(
 name = 'PhotoTourismSPSG',
@@ -121,7 +122,30 @@ ScanNet = dotdict(
     train=['train'],
 )
 
-datasets = [PhotoTourismSPSG, PhotoTourismRootSIFT, ScanNet, LAMAR, ETH3D, KITTI]
+HEB = dotdict(
+    name='HEB',
+    type='H',
+    root='./data/HEBHomographyDataset/',
+    RT_path_train='./data/HEBHomographyDataset/training_and_validation',
+    RT_path_test='./data/HEBHomographyDataset/test/',
+test = [
+    'Ellis_Island',
+    'Piazza_del_Popolo',
+    'Tower_of_London',
+    'Vienna_Cathedral',
+    'Madrid_Metropolis',
+    'Roman_Forum',
+    'Union_Square',
+    'Yorkminster'
+    ]
+,
+val = [
+    'Alamo',
+    'NYC_Library'
+]    
+)
+
+datasets = [PhotoTourismSPSG, PhotoTourismRootSIFT, ScanNet, LAMAR, ETH3D, KITTI, HEB]
 
 
 def username():
@@ -464,29 +488,6 @@ def test_loader(loader):
     # print(C)
 
 
-HEB = dotdict(
-    name='HEB',
-    type='homography',
-    root='./data/HEBHomographyDataset/',
-    RT_path_train='./data/HEBHomographyDataset/training_and_validation',
-    RT_path_test='./data/HEBHomographyDataset/test/',
-test = [
-    'Ellis_Island',
-    'Piazza_del_Popolo'
-    'Tower_of_London',
-    'Vienna_Cathedral',
-    'Madrid_Metropolis',
-    'Roman_Forum',
-    'Union_Square',
-    'Yorkminster'
-    ]
-,
-val = [
-    'Alamo',
-    'NYC_Library'
-]    
-)
-
 def load_h5(filename):
     '''Loads dictionary from hdf5 file'''
     dict_to_load = {}
@@ -497,7 +498,7 @@ def load_h5(filename):
     return dict_to_load
 
 class H_dataset(data.Dataset):
-    def __init__(self, dataset_info, scene, padding=False, size=3000) -> None:
+    def __init__(self, dataset_info, scene, padding=False, size=3000, snn_threshold = 0.9) -> None:
         self.padding = padding
         self.size = size
         config_path = dataset_info.root + '/dataset_configuration.yaml'
@@ -514,7 +515,7 @@ class H_dataset(data.Dataset):
             if scene == s['name']:
                 scene_scale = s['scale']
                 scene_f = s['filename']
-                if s in configuration['TEST_SCENES']:
+                if s in configuration['TEST_SCENES'] and not s in configuration['TRAIN_SCENES']:
                     root = dataset_info.RT_path_test
                 else:
                     root = dataset_info.RT_path_train
@@ -531,7 +532,7 @@ class H_dataset(data.Dataset):
         self.kind = 'homography'
         self.scene_scale = scene_scale
         self.scene = scene
-        # Add SNN_filter?
+        self.snn_threshold = snn_threshold
         # select a subset of image pairs?
         file = self.src + '_compressed.pkl'
 
@@ -559,6 +560,7 @@ class H_dataset(data.Dataset):
         self.files = sorted([x.replace('corr_','') for x in self.data.keys() if x.startswith('corr_')])
         Data.meta.files = self.files
         Data.meta.scale = self.scene_scale
+        Data.meta.snn_threshold = self.snn_threshold
         print(f"Number of pairs: {len(self.files)}")
         #
         for i in range(len(self)):
@@ -587,22 +589,27 @@ class H_dataset(data.Dataset):
     def __getitem__load(self, index):
         p = self.files[index]
         data = self.data
-        corr = data[f'corr_{p}'] # The SIFT unnormalized correspondences [num_pts x 10]: [X1, Y1, X2, Y2, angle1, angle2, scale1, scale2, snn_ratio, is_inlier_gt]
-        pose = data[f'pose_{p}'] # The ground truth relative pose coming from the COLMAP reconstruction, 3x4 matrix ?
-        size1 = data[f"size_{ '_'.join(p.split('_')[0:3]) }"] # The size of the source image
-        size2 = data[f"size_{ '_'.join(p.split('_')[3:6]) }"] # The size of the destination image
-        K1 = data[f"K_{ '_'.join(p.split('_')[0:3]) }"] # The intrinsic matrix of the source image 3x3, single focal length, principle point at size/2
-        K2 = data[f"K_{ '_'.join(p.split('_')[3:6]) }"]        
-        num_pts = corr.shape[0]
+        corr = data[f'corr_{p}'] # The SIFT unnormalized correspondences [num_pts x 9]: [X1, Y1, X2, Y2, angle1, angle2, scale1, scale2, snn_ratio, is_inlier_gt]
+        snn_ratio = corr[:,-2]
+        mask = snn_ratio < self.snn_threshold
+        C = corr[mask, 0:4].astype(np.float32)
+        pose = data[f'pose_{p}'].astype(np.float64) # The ground truth relative pose coming from the COLMAP reconstruction, 3x4 matrix ?
+        size1 = data[f"size_{ '_'.join(p.split('_')[0:3]) }"].astype(np.float32) # The size of the source image
+        size2 = data[f"size_{ '_'.join(p.split('_')[3:6]) }"].astype(np.float32) # The size of the destination image
+        K1 = data[f"K_{ '_'.join(p.split('_')[0:3]) }"].astype(np.float32) # The intrinsic matrix of the source image 3x3, single focal length, principle point at size/2
+        K2 = data[f"K_{ '_'.join(p.split('_')[3:6]) }"].astype(np.float32)  
+        num_pts = C.shape[0]
         r = {
-            'correspondences': corr,
+            'correspondences': C,
             'K1': K1,
             'K2': K2,
             'size1': size1,
             'size2': size2,
             'num_pts': num_pts,
             'files': p,
-            'GT': pose,
+            'gt_R': pose[:,0:3],
+            'gt_t': pose[:,3],
+            'models': torch.empty(size=(0,3,3)).numpy(),
         }
         return r
 
@@ -615,21 +622,11 @@ class H_dataset(data.Dataset):
             y = torch.cat([C[..., 2:4], C.new_ones(list(C.shape[:-1]) + [1])], dim=-1)
             K1 = torch.tensor(data['K1']) # [3, 3] -- paired with x
             K2 = torch.tensor(data['K2']) # [3, 3] -- paired with y
-            K1I = K1.inverse()
-            K2I = K2.inverse()
-            x = torch.einsum('ij, nj -> ni', K1I, x)
-            y = torch.einsum('ij, nj -> ni', K2I, y)
-            x = x[:,0:2]/x[:,-1:]
-            y = y[:, 0:2]/y[:, -1:]
+            x = normalize_points(x, K1)
+            y = normalize_points(y, K2)
             C = torch.cat([x,y], dim=-1)
             data['correspondences'] = C.numpy()
-            # convert model H to normalized coordinates:
-            H = torch.tensor(data['GT'])
-            # TODO:
-            # E = torch.einsum('ij, mik, kl -> mjl', K2, F, K1)  # K2^{-T} F K1^{-1}
-            # data['models'] = E
             self.padd_data(data)
-            data["is_H"] = True  # Homography flag
             return data
         else:
             return self.__getitem__load(index)
@@ -652,7 +649,8 @@ if __run__:
         test_loader(loader)
     if True:
         dataset_info = HEB
-        scene = 'Piazza_del_Popolo'
+        # scene = 'Piazza_del_Popolo'
+        scene = 'Alamo'
         dataset = H_dataset(dataset_info, scene, padding=True)
         loader = torch.utils.data.DataLoader(dataset, batch_size=32, num_workers=0, shuffle=False)
         test_loader(loader)

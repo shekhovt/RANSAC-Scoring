@@ -8,6 +8,7 @@ import math
 import copy
 import scipy
 from scipy.special import gamma, gammainc, gammaincc
+from scipy.stats import chi2
 from collections import namedtuple
 from types import SimpleNamespace
 import os
@@ -1231,22 +1232,25 @@ class MethodGT:
 # -----------------------------------------------------------------------------
 
 class ScoreWeightsMAGSAC(nn.Module):
-    def __init__(self, maximum_threshold: float = 10, N_bins: int = 200, max_distance: float = 10**2):
+    def __init__(self, maximum_threshold: float = 10, N_bins: int = 200, max_distance: float = 10**2, dof: int = 4):
         super().__init__()
         self.maximum_threshold = maximum_threshold
         self.N_bins = N_bins
         self.max_distance = max_distance
-
+        self.dof = dof
     def _WS(self):
         maximum_threshold = self.maximum_threshold
         # The degrees of freedom of the data from which the model is estimated.
         # E.g., for models coming from point correspondences (x1,y1,x2,y2), it is 4.
-        degrees_of_freedom = 4
+        degrees_of_freedom = self.dof
         # A 0.99 quantile of the Chi^2-distribution to convert sigma values to residuals
         alpha = 0.99
-        k = 3.64
-        # degrees_of_freedom = 2
-        # k = 3.03
+        if degrees_of_freedom == 4:
+            k = 3.64
+        elif degrees_of_freedom == 2:
+            k = 3.03
+        else:
+            k = np.sqrt(chi2.ppf(alpha, degrees_of_freedom))
         C = 1 / (2**(degrees_of_freedom / 2) * gamma(degrees_of_freedom / 2)*alpha)
         # Convert the maximum threshold to a sigma value
         maximum_sigma = maximum_threshold / k

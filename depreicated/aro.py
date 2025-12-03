@@ -5,8 +5,8 @@ import math
 import kornia
 from torch import Tensor
 
-from .functional import *
-from .score_weights import compute_residuals, sufficient_statistic
+from ..functional import *
+from ..score_weights import compute_residuals, sufficient_statistic
 
 
 try:

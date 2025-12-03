@@ -30,6 +30,7 @@ def R_error(R: Tensor, R_gt: Tensor) -> Tensor:
         dR = torch.einsum('...ij, ...kj -> ...ik', R, R_gt)  # R R_gt^T
         r = kornia.geometry.conversions.rotation_matrix_to_axis_angle(dR.view(-1, 3, 3)).view(dR.shape[:-1])  # [..., 3]
         e_R = r.norm(dim=-1) / math.pi * 180  # [...]    
+        e_R = torch.nan_to_num(e_R, nan=float('180')) # for padded models
     return e_R
 
 def t_error(T: Tensor, T_gt: Tensor) -> Tensor:
@@ -41,6 +42,7 @@ def t_error(T: Tensor, T_gt: Tensor) -> Tensor:
     cos = (T*T_gt).sum(dim=-1)/(T.norm(dim=-1)*T_gt.norm(dim=-1))  # [*]
     cos = cos.clip(min=-1, max=1)  # numerical fix
     e_t = torch.acos(cos) / math.pi * 180
+    e_t = torch.nan_to_num(e_t, nan=float('180')) # for padded models
     return e_t
 
 

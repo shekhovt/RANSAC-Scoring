@@ -4,7 +4,7 @@ import subprocess
 # import torch
 
 #----------------------
-from rci import tasks_per_gpu
+from depreicated.rci import tasks_per_gpu
 
 keys = ["SLURM_NODEID", "SLURM_ARRAY_TASK_ID", "SLURM_STEP_ID", "SLURM_PROCID", "SLURM_STEP_NUM_TASKS", "SLURM_TASK_PID"]
 # print SLURM variables identifying the task 

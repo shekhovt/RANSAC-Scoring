@@ -2,7 +2,7 @@
 # %%
 import os, sys
 if __name__ == "__main__":   
-    __name__ = 'score_learn.evaluate.py'
+    __name__ = 'score_learn.evaluate_H.py'
     __package__ = 'score_learn'
     __run__ = True
     abspath = os.path.abspath(__file__)
@@ -32,10 +32,12 @@ from types import SimpleNamespace
 
 from .score_weights import *
 from .load_data import *
-from .metrics import * #ARO_candidates, pose_error_EE, pose_error_EERT
-from .depreicated.aro import * #ARO_candidates, pose_error_EE, pose_error_EERT
+from .metrics import *
 from . import local_optimization as LO
 from .drawing import *
+
+from . import model_H
+from .model_H import new_minimal_models, pose_error_batch_torch, AUC_10, compute_residuals
 
 
 op = ArgumentParser()
@@ -45,20 +47,18 @@ op.add_argument("--val_pairs", type=int, default=1000, help="number of image pai
 op.add_argument("--val_thresholds", type=int, default=200, help="grid of thresholds subdividing [0.1 10] for validation")
 op.add_argument("--N_bins", type=int, default=500, help="histogram size for residuals")
 op.add_argument("--max_distance", type=float, default=10.0, help="max distance for the histogram")
-op.add_argument("--polish", default=0, type=str, help="0 - no polish, 1 - BA, 2 - LMeDs, 3 - ARO, 4 - ARO + BA, 5 - LMeds + BA, GaU - our polish (EM-LMA GaU) , MSAC - our polish (EM-LMA MSAC)")
-# op.add_argument("--data", type=str, default='PhotoTourismSPSG', help ="dataset")
-op.add_argument("--data", type=str, default='PhotoTourismRootSIFT', help="dataset")
-# op.add_argument("--data", type=str, default='KITTI', help="dataset")
+op.add_argument("--polish", default=0, type=str, help="0 - no polish, 1 - BA, 2 - LMeDs, GaU - our polish (EM-LMA GaU) , MSAC - our polish (EM-LMA MSAC)")
+op.add_argument("--data", type=str, default='HEB', help="dataset")
 op.add_argument("-V", "--validate", action='store_true', default=False, help="recompute validation")
 op.add_argument("-R", "--recompute", action='store_true', default=False, help="recompute test")
 op.add_argument("--running", action='store_true', default=False, help="running test")
-op.add_argument("--kde", action='store_true', default=False, help="running test")
+op.add_argument("--kde", action='store_true', default=False, help="?")
 op.add_argument("--geom", action='store_true', default=False, help="error geometry analysis")
 op.add_argument("--inliers", action='store_true', default=False, help="inliers statistics experiment")
 op.add_argument("--static", action='store_true', default=False, help="static 1K test, DEPRICATED")
-op.add_argument("--var", type=bool, default=True, help="variance test")
+op.add_argument("--var", type=bool, default=False, help="variance test")
 op.add_argument("--F", action='store_true', default=False, help="use solver for F matrix (regardless of the dataset)")
-op.add_argument("--new_models", type=bool, default=True, help="sample new models for validation instead of saved ones")
+op.add_argument("--new_models", type=bool, default=True, help="sample new models, cannot be changed")
 
 args_str = ' '.join(sys.argv[1:])
 ops, args = op.parse_known_args(shlex.split(args_str))
@@ -69,9 +69,9 @@ o.validate = True
 # o.F = True
 # o.geom = True
 # o.inliers = True
-# o.R = True
+o.R = True
 # o.var = True
-o.var = False
+# o.var = False
 ##
 ##
 
@@ -84,14 +84,6 @@ except:
 polish = o.polish
 if polish == 0:
     polish_func = None
-elif polish == 1:
-    polish_func = best_BA
-elif polish == 2:
-    polish_func = best_LMEDS
-elif polish == 3:
-    polish_func = best_ARO
-elif polish == 4:
-    polish_func = best_ARO_BA
 elif not (polish == 'GaU' or polish == 'MSAC'):
     print("undefined polishing method!")
 
@@ -102,14 +94,19 @@ if dataset_info.name != o.data:
     print(f'cannot find dataset {o.data}')
     exit(1)
 
-o.F = (dataset_info.Fundamental or o.F)
+o.type = dataset_info.type
+
+if dataset_info.type == 'H':
+    o.avg_solutions = 1
+    o.minimal_sample = 4
+    o.min_solver = model_H.solve_homography
+    o.MAGSAC_dof = 2
+
 
 Eval_GCMAGSAC = False
 
-# val_scenes = dataset_info.val
-# val_scenes = dataset_info.test
-val_scenes = dataset_info.val[3:4]
-# test_scenes = dataset_info.test #[7:8]
+# val_scenes = dataset_info.val[0:1]
+val_scenes = dataset_info.test[1:2]
 test_scenes = dataset_info.test
 res_root = f'results/{dataset_info.name}/'
 results_file0 = res_root + f'polish={polish}/' + f'test_results.pkl'
@@ -118,6 +115,17 @@ if Eval_GCMAGSAC:
     res_root += 'GCMAGSAC/'
 results_path = res_root + f'polish={polish}/'
 val_file = res_root + f'val_results.pkl'
+
+def create_loader(val_src):
+    if dataset_info.type == 'H':
+        dataset = H_dataset(dataset_info, val_src, padding=True)
+    else:
+        raise NotImplementedError()
+        dataset = ResidualData(dataset_info, val_src, padding=True) # padding the 
+    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, num_workers=0, shuffle=True)
+    return loader
+    
+torch.manual_seed(0)
 
 def set_results_paths(folder = ''):
     global results_file
@@ -144,314 +152,7 @@ def best_score(ss, M):
     return best_s, best_idx  # [B T] / [B]
 
 
-def local_optimization_ours(data, models, W):
-    """
-    data - dict with batched data:
-        correspondences [B, N, 4]
-        K1,
-        K2
-    models [B, 3, 3] -- current best models
-    W - ScoreWeights with functions score_residuals and IRLS_weights
-    return:
-     rmodels [B, 3, 3] -- optimized best models
-    """
-    x, y = normalized_points(data)
-    KX = data['K1'].to(x)
-    KY = data['K2'].to(x)
-    models = models.to(x)
-    def score_f(rr):
-        s = W.score_residuals(rr, reduction=None)
-        return s
-    def weight_f(rr):
-        s = W.IRLS_weight(rr)
-        return s
-    E1 = LO.local_optimization(x, y, KX, KY, LO.E_parameterization(models),score_f, weight_f, iterations = 25)
-    return E1
-
-def local_optimization_PoseLib(data, models, loss_type):
-    """
-    models [B, 3, 3]
-    return:
-     rmodels [B, 3, 3] -- optimized best models
-    """
-    def camera_dict_from_matrix(K):
-        return {'model': 'SIMPLE_PINHOLE', 'width': int(K[0, 2]*2), 'height': int(K[1, 2]*2), 'params': [float((K[0, 0] + K[1, 1])/2), float(K[0, 2]), float(K[1, 2])]}
-    
-    models = copy.deepcopy(models)
-    
-    bo = {'max_iterations': 25, 'loss_type': loss_type, 'loss_scale': WMSAC.tau}
-    X1, X2 = unnormalized_points(data)
-    X1 = X1.cpu().double().numpy()
-    X2 = X2.cpu().double().numpy()
-    R1, R2, t1 = kornia.geometry.epipolar.decompose_essential_matrix(models)
-    for b in range(models.shape[0]):
-        K1 = data['K1'][b].double().numpy()
-        K2 = data['K2'][b].double().numpy()
-        C1 = camera_dict_from_matrix(K1)
-        C2 = camera_dict_from_matrix(K2)
-        P = poselib.CameraPose()
-        P.R = R1[b]
-        P.t = t1[b]
-        # check can recompose
-        # E = LO.compose_essential_matrix(torch.tensor(P.R), torch.tensor(P.t))
-        n = data['num_pts'][b]
-        x1 = X1[b,:n,:2]
-        x2 = X2[b,:n,:2]
-        P,B = poselib.refine_relative_pose(x1, x2, P, C1, C2, bo)
-        E = LO.compose_essential_matrix(torch.tensor(P.R), torch.tensor(P.t))
-        models[b] = E
-    return models
-    
-
-def local_optimization(data, models, polish):
-    if polish == 'GaU':
-        return local_optimization_ours(data, models, WGU)
-    elif polish == 'MSAC':
-        return local_optimization_ours(data, models, WMSAC)
-    elif polish in ['TRIVIAL', 'TRUNCATED', 'HUBER', 'CAUCHY', 'TRUNCATED_LE_ZACH']:
-        return local_optimization_PoseLib(data, models, polish), 0
-    else:
-        raise AttributeError(f'Polish method {polish} unrecognized')
-
-
-def new_minimal_models(data, m_batch_size, max_average_sol=None, include_GT=False):
-    C = data['correspondences'] # [B, max_N, 4]
-    xx = torch.cat([C[..., :2], C.new_ones(list(C.shape[:-1]) + [1])], dim=-1)
-    yy = torch.cat([C[..., 2:], C.new_ones(list(C.shape[:-1]) + [1])], dim=-1)
-    n_points = data['num_pts']
-    max_models = 0
-    models = [[] for b in range(C.shape[0])]
-    for b in range(C.shape[0]):
-        n = n_points[b]
-        log_p = (C.new_ones((n,))/n).log()
-        ii = sample_subsets(5, log_p, m_batch_size)
-        x1 = xx[b,:n][ii,:].cpu().numpy().astype(float)
-        y1 = yy[b,:n][ii, :].cpu().numpy().astype(float)
-        EE = solve_epipolar(x1,y1)
-        n_models = len(EE)
-        max_models = max(max_models, n_models)
-        models[b] = EE
-    # assert(max_models > 1000)
-    if max_average_sol is not None:
-        max_models = min(max_models, m_batch_size*max_average_sol)
-    for b in range(C.shape[0]):
-        if len(models[b]) > max_models:
-            models[b] = models[b][:max_models]
-        else:
-            models[b] = np.concatenate([np.stack(models[b]), np.zeros((max_models - len(models[b]), 3, 3))])
-    models = np.stack(models) # stack along batch dim
-    models = torch.tensor(models).to(dtype= torch.float32).cpu()
-    #
-    # data['models'][:,:1000] = models # use 1K models
-    if include_GT:
-        GTmodels = data['models'][:,-1:].to(models)
-        models = torch.cat([models, GTmodels], dim = 1)
-    data['models'] = models
-    # errors, _, _ = pose_error_batch_torch(data['models'][:,:-1], data)
-    # data['errors'][:,:1000] = errors
-
-
-def new_minimal_models_F(data, m_batch_size, max_average_sol=None, include_GT=False):
-    # C = data['correspondences'].double() # [B, max_N, 4]
-    # X1 = C[..., :2] # normalized points
-    # X2 = C[..., 2:]
-    X1, X2 = unnormalized_points(data)
-    X1 = X1[:,:,:2].double() # [B, max_N, 3] chop off homogenous 1
-    X2 = X2[:,:,:2].double()
-    B = X1.shape[0]
-    n_points = data['num_pts']
-    max_models = 0
-    models = [[] for b in range(B)]
-    for b in range(B):
-        K1 = data['K1'][b]
-        K2 = data['K2'][b]
-        n = n_points[b]
-        if n>=7:
-            log_p = (X1.new_ones((n,))/n).log()
-            ii = sample_subsets(7, log_p, m_batch_size)
-            x1 = X1[b,:n][ii,:] # [mbatch, 7, 2]
-            y1 = X2[b,:n][ii,:]
-            FF = []
-            for i in range(x1.shape[0]):
-                F = cv2.findFundamentalMat(x1[i].cpu().numpy(),y1[i].cpu().numpy(),cv2.FM_7POINT)[0]
-                if F is not None and isinstance(F,np.ndarray) and F.shape[0] > 0:
-                    FF += [torch.tensor(F).view([-1,3,3])]
-            FF = torch.cat(FF, dim = 0).cuda()
-            # FF = kornia.geometry.epipolar.find_fundamental(x1, y1, weights=None, method='7POINT')
-            FF = FF.view([-1,3,3])
-            EE = torch.einsum('ij, mik, kl -> mjl', K2.to(FF), FF, K1.to(FF))  # K2^{T} F K1
-            # EE = FF
-        else:
-            EE = torch.zeros((0,3,3)).float().cuda()
-        #
-        n_models = len(EE)
-        max_models = max(max_models, n_models)
-        models[b] = EE.cpu().numpy()
-    # max_models = m_batch_size*3
-    if max_average_sol is not None:
-        max_models = min(max_models, m_batch_size*max_average_sol)
-    for b in range(B):
-        if len(models[b]) > max_models:
-            models[b] = models[b][:max_models]
-        else:
-            models[b] = np.concatenate([models[b], np.zeros((max_models - len(models[b]), 3, 3))])
-    models = np.stack(models) # stack along batch dim
-    models = torch.tensor(models).to(dtype= torch.float32).cpu()
-    if include_GT:
-        GTmodels = data['models'][:,-1:].to(models)
-        models = torch.cat([models, GTmodels], dim = 1)
-    data['models'] = models
-    data['is_F'][:] = False
-
-
-def decompose_SVDZ(EE):
-    U,s,Vh = torch.linalg.svd(EE) # [n,3,3]
-    s[-1] = 0
-    s[0:2] = 1
-    S = torch.diag_embed(s)
-    EE = U @ S @ Vh
-    if torch.linalg.det(U) < 0:
-        U[:,-1] = - U[:,-1]
-    if torch.linalg.det(Vh) < 0:
-        Vh[-1,:] = - Vh[-1,:]
-    assert (torch.linalg.det(U) > 0 )
-    assert (torch.linalg.det(Vh) > 0 )
-    # assert ((EE - U @ S @ Vh).abs().max() < 1e-3)
-    #
-    def decompose_Z(U, transpose = False):
-        if transpose:
-            U = U.T
-        q = TR.from_matrix(U).as_quat()
-        gamma = math.atan2(q[-2], q[-1])
-        theta = 2 * gamma
-        Rz = TR.from_euler('z', theta).as_matrix()
-        # qz = TR.from_euler('z', theta).as_quat()
-        Uz = U @ Rz.T
-        alpha = TR.from_matrix(Uz).magnitude()
-        assert(TR.from_matrix(Uz).magnitude() <= TR.from_matrix(U).magnitude())
-        if transpose:
-            return Rz.T, Uz.T, alpha
-        else:
-            return Uz, Rz, alpha
-    if False:
-        def decompose_Z(U):
-            a = TR.from_matrix(U.numpy()).as_euler('zxy')
-            R1 = TR.from_euler('xy', a[1:]).as_matrix()
-            R2 = TR.from_euler('z', a[0]).as_matrix()
-            U1 = R1 @ R2
-            assert ((U - U1).abs().max() < 1e-3)
-            return R1, R2
-    a_min = 1000
-    for i in range(3):
-        if i == 0:
-            d = [1,1,1]
-        elif i==1:
-            d = [-1,1,-1]
-        else:
-            d = [1,-1,-1]
-        D = np.diag(d)
-        R1, R2, a1 = decompose_Z(U.numpy() @ D )
-        R3, R4, a2 = decompose_Z(D @ Vh.numpy(), transpose=True)
-        a = abs(a1) + abs(a2)
-        if a < a_min:
-            a_min= a
-            S_m = R2 @ S.numpy() @ R3
-            R1_m = R1
-            R4_m = R4
-            # a = TR.from_matrix(Vh.numpy()).as_euler('xyz')
-            # R3 = TR.from_euler('z', a[2]).as_matrix()
-            # R4 = TR.from_euler('xy', a[0:2]).as_matrix()
-        # Vh1 = R3 @ R4
-        # assert ((Vh - Vh1).abs().max() < 1e-3)
-        # recompose
-        # S1 = R2 @ S.numpy() @ R3
-    # assert ((EE - R1 @ S1 @ R4).abs().max() < 1e-3)
-    M  = R1_m @ S_m @ R4_m
-    assert ((EE - M).abs().max() < 1e-3)
-    return R1_m, S_m, R4_m
-
-def random_rotation(n, deg, sampling = 'uniform', t = None):
-    if deg is not None:
-        assert(n == len(deg))
-    d = torch.normal(torch.zeros(n, 3)) # [n, 3]
-    if t is not None: # project orthogonal to t
-        tn = F.normalize(t, dim=-1).unsqueeze(0)
-        d = d - (d*tn).sum(dim=-1, keepdim=True)*tn
-    d = F.normalize(d, dim=-1) # approx uniform direction vector
-            
-    if sampling == 'uniform':
-        theta = (torch.rand(n, 1) - 0.5)*deg/180*math.pi # amount of rotation in radians
-    elif sampling == None or sampling == 'bernoulli': 
-        if len(deg) > 1:
-            theta = (deg/180*math.pi).view([-1, 1])
-        else:
-            theta = torch.ones(n, 1)*deg/180*math.pi
-    # l = torch.tan(theta / 4)
-    l = theta
-    d = d * l
-    # R = TR.from_mrp(d.numpy()).as_matrix()
-    R = TR.from_rotvec(d.numpy()).as_matrix()
-    return torch.tensor(R)
-
-
-def new_perturbed_models(data, n=1000, deg = 10):
-    C = data['correspondences'] # [B, max_N, 4]
-    models = [[] for b in range(C.shape[0])]
-    for b in range(C.shape[0]):
-        # GTE = data['models'][b,-1] # GT model
-        # (R1, R2, T) = kornia.geometry.decompose_essential_matrix(GTE)
-        # R1 = R1.squeeze(dim=0)
-        # T = T.squeeze(dim=-1)
-        gt_R = to_tensor(data['gt_R'])[b]
-        gt_T = to_tensor(data['gt_t'])[b].squeeze(-1)
-        dR = random_rotation(n, deg)
-        Rp = dR @ gt_R
-        dR = random_rotation(n, deg)
-        Tp = dR @ gt_T
-        E = LO.compose_essential_matrix(torch.tensor(Rp), torch.tensor(Tp))
-        models[b] = E
-        # (R1, R2, T) = kornia.geometry.decompose_essential_matrix(E)
-        # T = T.squeeze(-1)
-        # err_R = torch.min(R_error(R1, gt_R), R_error(R2, gt_R))
-        # err_t = torch.min(t_error(T, gt_T), t_error(-T, gt_T))
-        pass
-    models = np.stack(models) # stack along batch dim
-    models = torch.tensor(models)
-    # data['models'][:,:n] = models # replace first n models
-    data['models'] = torch.cat([data['models'][:,:-1], models, data['models'][:,-1:]], dim = 1 ).cuda()
-
-
-def augment_models(data, ref_models, n=1000, deg = 10):
-    B = ref_models.shape[0]
-    models = [[] for b in range(B)]
-    for b in range(B):
-        GTE = ref_models[b].double() # GT model
-        (R1, R2, T) = kornia.geometry.decompose_essential_matrix(GTE)
-        gt_R = R1.squeeze(dim=0)
-        gt_T = T.squeeze(dim=-1)
-        # gt_R = to_tensor(data['gt_R'])[b]
-        # gt_T = to_tensor(data['gt_t'])[b].squeeze(-1)
-        tp = 'uniform'
-        # tp = None
-        dR = random_rotation(n, deg, tp)
-        Rp = dR @ gt_R
-        dR = random_rotation(n, deg, tp)
-        Tp = dR @ gt_T
-        E = LO.compose_essential_matrix(torch.tensor(Rp), torch.tensor(Tp))
-        models[b] = E
-        # (R1, R2, T) = kornia.geometry.decompose_essential_matrix(E)
-        # T = T.squeeze(-1)
-        # err_R = torch.min(R_error(R1, gt_R), R_error(R2, gt_R))
-        # err_t = torch.min(t_error(T, gt_T), t_error(-T, gt_T))
-        pass
-    models = np.stack(models) # stack along batch dim
-    models = torch.tensor(models)
-    # data['models'][:,:n] = models # replace first n models
-    data['models'] = torch.cat([data['models'][:,:-1], models, data['models'][:,-1:]], dim = 1 ).cuda()
-
 def new_errors(data):
-    if data['is_F'][0]:
-        raise NotImplementedError('Need to convert F to E for the erorr metric first')
     errors, errors_r, errors_t = pose_error_batch_torch(data['models'], data)
     data['errors'] = errors.cpu()
     data['errors_r'] = errors_r.cpu()
@@ -475,72 +176,38 @@ def evaluate(loader, mode):
     for idx, data in enumerate(loader):
         if idx*o.batch_size>o.val_pairs and mode=='val':
             break
-        # F = data['models'][:, :-1].cuda()  # all models [B M]
-        # C = data['correspondences'].numpy()
-        if o.new_models: # sample new models            
-            if o.F:
-                new_minimal_models_F(data, o.val_samples)
-            else:
-                new_minimal_models(data, o.val_samples, max_average_sol=5)
-            # errors, errors_r, errors_t = new_errors(data)
-        else:
-            data['models'] = data['models'][:, :-1, :] # select all but GT model residuals [B M N]
-            # errors = data['errors'][:, :-1].cuda()
-            # err_new, errors_r, errors_t = new_errors(data)
-            # data['errors'] = errors
-            # print(np.median((errors-err_new).cpu()))
+        start = time.time()
+        new_minimal_models(data, o.val_samples, max_average_sol=o.avg_solutions, min_sample=o.minimal_sample, solver=o.min_solver)
+        end = time.time()
+        if idx == 0:
+            print(f"new_minimal_models takes {end - start:.4f} seconds")
         # compute errors anew
         data['models'] = data['models'].cuda()
-        errors_saved = data['errors'][:, :-1].cuda().clone()
+        start = time.time()
         errors, errors_r, errors_t = new_errors(data)
-        if not o.new_models:
-            for b in range(errors.shape[0]):
-                diff = (torch.logical_and(errors[b] < 5, (errors[b] - errors_saved[b]).abs() > 0.1))
-                ndiff = diff.sum()
-                if ndiff >0:
-                    id = torch.argwhere(diff).cpu().numpy().squeeze(-1)
-                    print(data['files'][b])
-                    print('model indices:', id)
-                    np.set_printoptions(precision=5)
-                    print('saved errors:', errors_saved[b][id].cpu().numpy())
-                    print('computed errors:', errors[b][id].cpu().numpy())
-                assert(ndiff == 0)
-        
-        if False:
-            for i, models in enumerate(data['models']):
-                nan_mask = np.unique(np.where(np.isnan(models.cpu().numpy()))[0])
-                if len(nan_mask) != 0:
-                    data['models'][i][nan_mask] = torch.eye(3)
-                    data['errors'][i][nan_mask] = 180
-        
-        if False: #
-            best_idx = data['errors'][:,:-1].argmin(dim=-1) # oracle has access to GT error function
-            best_models = select_dim1(data['models'], best_idx)
-            
-            # new_perturbed_models(data, 500, 2.5)
-            augment_models(data, best_models, 500, 0.7)
-            new_errors(data)
-        
+        end = time.time()
+        if idx == 0:
+            print(f"new_errors takes {end - start:.4f} seconds")
+        assert((errors <= 180).all())
         if mode == 'test':
             pass
-            # doctor 0'th model to be the selected from GC-RANCAS-MAGSAC++
-            # data['models'][:,0,:,:] = data['magsac_selected'] # replace at index 0
+        start = time.time()
         compute_residuals(data)
+        end = time.time()
+        if idx == 0:
+            print(f"compute_residuals takes {end - start:.4f} seconds")
         R = data['residuals']
-        # R = data['residuals'][:, :-1, :].cuda() # select all but GT model residuals [B M N]
-        # errors = data['errors'][:, :-1]  # select all but GT model errors [B M]
-        assert((errors <= 180).all())
         exclude_mask = errors > 1000
         # hash = dict()
-        if mode == 'kde':
-            SS = []
-            unnormalized_points(data)
-            for bw in kde_xval:
-                compute_kde_weights(data, bw)
-                weights = data['kde_weights'].cuda().unsqueeze(-2)
-                ss = sufficient_statistic(R, N_bins, max_distance=max_distance, weights = weights)  # [B M K]
-                SS.append(ss.counts)
-            SS = torch.stack(SS, dim=0) # [w B M K]
+        # if mode == 'kde':
+        #     SS = []
+        #     unnormalized_points(data)
+        #     for bw in kde_xval:
+        #         compute_kde_weights(data, bw)
+        #         weights = data['kde_weights'].cuda().unsqueeze(-2)
+        #         ss = sufficient_statistic(R, N_bins, max_distance=max_distance, weights = weights)  # [B M K]
+        #         SS.append(ss.counts)
+        #     SS = torch.stack(SS, dim=0) # [w B M K]
               
         for W in methods:
             if isinstance(W, MethodGT):
@@ -548,23 +215,19 @@ def evaluate(loader, mode):
             if isinstance(W, Oracle): # oracle errors
                 best_idx = errors.argmin(dim=-1) # oracle has access to GT error function
                 best_models = select_dim1(data['models'], best_idx)
-            # elif isinstance(W, GCMAGSAC):
-            #     best_idx = errors.argmin(dim=-1) # does not matter
-            #     best_models = data['magsac_selected']
             else:
                 W.to(R)
                 if mode == 'kde':
-                    M = W.val_w
-                    # scores = torch.einsum('BMKw, K ->BMw',SS, M) # [B M w]
-                    scores = (SS @ M).permute(1,2,0) # [B M w]
-                    best_s, best_idx = scores.max(dim=1)
-                    best_s = best_s.cpu()
-                    best_idx = best_idx.cpu()
+                    raise NotImplementedError()
+                    # M = W.val_w
+                    # # scores = torch.einsum('BMKw, K ->BMw',SS, M) # [B M w]
+                    # scores = (SS @ M).permute(1,2,0) # [B M w]
+                    # best_s, best_idx = scores.max(dim=1)
+                    # best_s = best_s.cpu()
+                    # best_idx = best_idx.cpu()
                 else:
                     ss = sufficient_statistic(R, W.N_bins, max_distance=W.max_distance, pow=W.pow)  # [B M K]
                     if mode == 'val' and not hasattr(W, 'locked'):
-                        # M = W.M.T
-                        # scores = ss.counts @ M  # [B M K] @ [K T] -> [B M T]
                         scores = torch.einsum('bmK, ...K ->bm...',ss.counts, W.M) # [B M ...]
                         if scores.ndim > 3:
                             scores = scores.logsumexp(dim = -1)
@@ -575,12 +238,6 @@ def evaluate(loader, mode):
                     else:
                         M = W.val_w
                         best_s, best_idx = best_score(ss, M)
-                # if W.name=='RANSAC(3)' and idx ==0:
-                #     for b in range(best_idx.shape[0]):
-                #         print('files:', data['files'][b], end='')
-                #         print(f' score: {best_s[b]:3.2f}', end='')
-                #         print(f' idx: {best_idx[b]:3.2f}', end='')
-                #         print(f' idx: {best_idx[b]:3.2f}', end='')
                 best_models = select_dim1(data['models'], best_idx)
                 
             # compute solution errors
@@ -593,28 +250,23 @@ def evaluate(loader, mode):
                 if polish == 0:
                     best_models = best_models.cpu().numpy()
                 elif polish == 'GaU':
+                    raise NotImplementedError()
                     best_models1, best_scores = local_optimization_ours(data, best_models.cuda(), WGU)
                     best_models = best_models1.cpu().numpy()
-                elif polish == 'GaU1':
-                    WP = copy.deepcopy(WGU)
-                    WP.set_hyperparam(WP.tau/1.1)
-                    best_models1, best_scores = local_optimization_ours(data, best_models.cuda(), WP)
-                    best_models = best_models1.cpu().numpy()                    
                 elif polish == 'MSAC':
+                    raise NotImplementedError()
                     best_models1, best_scores = local_optimization_ours(data, best_models.cuda(), WMSAC)
                     best_models = best_models1.cpu().numpy()
                 elif polish >0:
+                    raise NotImplementedError()
                     best_ee1, best_eer1, best_eet1, best_ss1, best_models1 = polish_func(data, best_idx, M, W)
-                    # TODO: since the polish function knows the score, it can make the choice of whether to keep the model internally
                     m = best_ss1 > best_s  # where polished models are improving the current score
                     best_e[m] = best_ee1[m]  # record their GT error
                     # import pdb; pdb.set_trace()
                     best_r[m] = best_eer1[m]
                     best_t[m] = best_eet1[m]
                     pass               
-                # compute test error of found models
-                # assume best_models [b, 3, 3] -- selected models by optimization or not
-                best_e, best_r, best_t = pose_error_batch(best_models, data)
+                best_e, best_r, best_t = pose_error_batch_torch(best_models, data)
                     
             eval_results[W].best_e += [best_e.cpu().numpy()]
             eval_results[W].best_r += [best_r.cpu().numpy()]
@@ -622,6 +274,8 @@ def evaluate(loader, mode):
 
         if idx % 10 == 0:
             print(idx*o.batch_size)
+        if idx > 3:
+            break # DEBUG
     # concatenate all batch results
     for m in methods:
         for k in eval_results[m].keys():
@@ -649,10 +303,7 @@ def evaluate_T(loader, n_pairs):
     for idx, data in enumerate(loader):
         if idx*o.batch_size>n_pairs:
             break
-        if o.F:
-            new_minimal_models_F(data, o.val_samples)
-        else:
-            new_minimal_models(data, o.val_samples, max_average_sol=5)
+        new_minimal_models(data, o.val_samples, max_average_sol=5)
         data['models'] = data['models'].cuda()
         errors, errors_r, errors_t = new_errors(data)
         compute_residuals(data)
@@ -700,348 +351,284 @@ else:
 def npstack(arrays):
     return np.stack(arrays) if len(arrays)>0 else np.zeros(shape =(0,0))
 
-def solve_epipolar(x1, x2):
-        m_batch_size = x1.shape[0]
-        EE = []
-        for i in range(m_batch_size):
-            E = poselib.essential_matrix_5pt(x1[i], x2[i])
-            EE.extend(E)
-        return EE
+# def test_running(loader):
+#     global methods
+#     global polishes
+#     eval_results = dict()
+#     for mp in itertools.product(methods, polishes):
+#         eval_results[mp] = dotdict()
+#         eval_results[mp].best_M = []
+#         eval_results[mp].running_s = []
+#         eval_results[mp].running_e = []
+#         eval_results[mp].running_r = []
+#         eval_results[mp].running_t = []
+#         eval_results[mp].running_M = []
 
-def test_running(loader):
-    global methods
-    global polishes
-    eval_results = dict()
-    for mp in itertools.product(methods, polishes):
-        eval_results[mp] = dotdict()
-        eval_results[mp].best_M = []
-        eval_results[mp].running_s = []
-        eval_results[mp].running_e = []
-        eval_results[mp].running_r = []
-        eval_results[mp].running_t = []
-        eval_results[mp].running_M = []
+#     files = []
+#     torch.manual_seed(0)
+#     m_batch_size = 100
+#     for idx, data in enumerate(loader):
+#         files += data['files']
+#         if idx>1000: # 
+#             break
+#         C = data['correspondences'] # [B, max_N, 4]
+#         xx = torch.cat([C[..., :2], C.new_ones(list(C.shape[:-1]) + [1])], dim=-1)
+#         yy = torch.cat([C[..., 2:], C.new_ones(list(C.shape[:-1]) + [1])], dim=-1)
+#         n_points = data['num_pts']
+#         res = dict()
+#         if o.kde: compute_kde_weights(data)
+#         for mp in itertools.product(methods, polishes):
+#             res[mp] = dotdict()
+#             res[mp].running_s = []
+#             res[mp].running_e = []
+#             res[mp].running_r = []
+#             res[mp].running_t = []
+#             res[mp].running_M = []
+#             res[mp].best_s = C.new_empty(C.shape[0]).fill_(-torch.inf) # best scores
+#             res[mp].best_M = C.new_zeros(C.shape[0],3,3)  # best models
 
-    files = []
-    torch.manual_seed(0)
-    m_batch_size = 100
-    for idx, data in enumerate(loader):
-        files += data['files']
-        if idx>1000: # 
-            break
-        C = data['correspondences'] # [B, max_N, 4]
-        xx = torch.cat([C[..., :2], C.new_ones(list(C.shape[:-1]) + [1])], dim=-1)
-        yy = torch.cat([C[..., 2:], C.new_ones(list(C.shape[:-1]) + [1])], dim=-1)
-        n_points = data['num_pts']
-        res = dict()
-        if o.kde: compute_kde_weights(data)
-        for mp in itertools.product(methods, polishes):
-            res[mp] = dotdict()
-            res[mp].running_s = []
-            res[mp].running_e = []
-            res[mp].running_r = []
-            res[mp].running_t = []
-            res[mp].running_M = []
-            res[mp].best_s = C.new_empty(C.shape[0]).fill_(-torch.inf) # best scores
-            res[mp].best_M = C.new_zeros(C.shape[0],3,3)  # best models
-
-        start0 = torch.cuda.Event(enable_timing=True)
-        end0 = torch.cuda.Event(enable_timing=True)
-        start1 = torch.cuda.Event(enable_timing=True)
-        end1 = torch.cuda.Event(enable_timing=True)
-        dt1 = 0; dt2 = 0; dt3=0; dtS=0; dtst=0; dtg=0; dtp=0
-        for m_batch in range(40):  # rounds of sampling, m_batch_size models in each round # 100for each
-            # save GT model from data
-            #
-            GTEs = data['models'][:, -1].clone().double() #[B,3,3]
-            # for each image in the batch generate a batch of models
-            # start1.record()
-            # max_models = 0
-            # models = [[] for b in range(C.shape[0])]
-            # for b in range(C.shape[0]):
-            #     n = n_points[b]
-            #     log_p = (C.new_ones((n,))/n).log()
-            #     ii = sample_subsets(5, log_p, m_batch_size)
-            #     # sample = points[ii, :]  # [n_samples, k, D]
-            #     x1 = xx[b,:n][ii,:].cpu().numpy().astype(float)
-            #     y1 = yy[b,:n][ii, :].cpu().numpy().astype(float)
-            #     EE = solve_epipolar(x1,y1)
-            #     n_models = len(EE)
-            #     max_models = max(max_models, n_models)
-            #     models[b] = EE
-            # end1.record()
-            # torch.cuda.synchronize()
-            # dt1+= start1.elapsed_time(end1)/1000
-            # for b in range(C.shape[0]):
-            #     models[b] = np.concatenate([np.stack(models[b]), np.zeros((max_models - len(models[b]), 3, 3))])
-            # models = np.stack(models) # stack along batch dim
-            # # print(max_models)
-            # models = torch.tensor(models).to(dtype= torch.float32).cuda()
-            # data['models'] = models
-            # start1.record()
-            # errors, _, _ = pose_error_batch_torch(data['models'], data)
-            # end1.record()
-            # torch.cuda.synchronize()
-            # dtg += start1.elapsed_time(end1)/1000
+#         start0 = torch.cuda.Event(enable_timing=True)
+#         end0 = torch.cuda.Event(enable_timing=True)
+#         start1 = torch.cuda.Event(enable_timing=True)
+#         end1 = torch.cuda.Event(enable_timing=True)
+#         dt1 = 0; dt2 = 0; dt3=0; dtS=0; dtst=0; dtg=0; dtp=0
+#         for m_batch in range(40):  # rounds of sampling, m_batch_size models in each round # 100for each
+#             # save GT model from data
+#             #
+#             GTEs = data['models'][:, -1].clone().double() #[B,3,3]
+#             # for each image in the batch generate a batch of models
+#             # start1.record()
+#             # max_models = 0
+#             # models = [[] for b in range(C.shape[0])]
+#             # for b in range(C.shape[0]):
+#             #     n = n_points[b]
+#             #     log_p = (C.new_ones((n,))/n).log()
+#             #     ii = sample_subsets(5, log_p, m_batch_size)
+#             #     # sample = points[ii, :]  # [n_samples, k, D]
+#             #     x1 = xx[b,:n][ii,:].cpu().numpy().astype(float)
+#             #     y1 = yy[b,:n][ii, :].cpu().numpy().astype(float)
+#             #     EE = solve_epipolar(x1,y1)
+#             #     n_models = len(EE)
+#             #     max_models = max(max_models, n_models)
+#             #     models[b] = EE
+#             # end1.record()
+#             # torch.cuda.synchronize()
+#             # dt1+= start1.elapsed_time(end1)/1000
+#             # for b in range(C.shape[0]):
+#             #     models[b] = np.concatenate([np.stack(models[b]), np.zeros((max_models - len(models[b]), 3, 3))])
+#             # models = np.stack(models) # stack along batch dim
+#             # # print(max_models)
+#             # models = torch.tensor(models).to(dtype= torch.float32).cuda()
+#             # data['models'] = models
+#             # start1.record()
+#             # errors, _, _ = pose_error_batch_torch(data['models'], data)
+#             # end1.record()
+#             # torch.cuda.synchronize()
+#             # dtg += start1.elapsed_time(end1)/1000
             
-            start1.record()
-            if o.F:
-                new_minimal_models_F(data, m_batch_size)
-            else:
-                new_minimal_models(data, m_batch_size)
-            end1.record()
-            torch.cuda.synchronize()
-            dt1+= start1.elapsed_time(end1)/1000
-            start1.record()
-            new_errors(data)
-            end1.record()
-            torch.cuda.synchronize()
-            dtg += start1.elapsed_time(end1)/1000
-            models = data['models'].float().cuda()
-            data['models'] = models
-            errors = data['errors'].float().cuda()
+#             start1.record()
+#             if o.F:
+#                 new_minimal_models_F(data, m_batch_size)
+#             else:
+#                 new_minimal_models(data, m_batch_size)
+#             end1.record()
+#             torch.cuda.synchronize()
+#             dt1+= start1.elapsed_time(end1)/1000
+#             start1.record()
+#             new_errors(data)
+#             end1.record()
+#             torch.cuda.synchronize()
+#             dtg += start1.elapsed_time(end1)/1000
+#             models = data['models'].float().cuda()
+#             data['models'] = models
+#             errors = data['errors'].float().cuda()
             
-            if False:
-                # pre-filter models
-                models = [None] * C.shape[0]
-                max_models = 0
-                # theta = np.linspace(-2,2,9,endpoint=True)/180*math.pi
-                theta = np.linspace(-0.5,0.5,9,endpoint=True)/180*math.pi
-                RR = torch.tensor(TR.from_euler('Z', theta).as_matrix()).float().cuda()
-                #    
-                for b in range(C.shape[0]):
-                    # extract SVDZ from GT
-                    # GTE = GTEs[b]
-                    gt_R = to_tensor(data['gt_R'])[b]
-                    gt_T = to_tensor(data['gt_t'])[b].squeeze(-1)
-                    GTE = LO.compose_essential_matrix(gt_R, gt_T)
-                    # Tp = gt_T
-                    # Rp = gt_R
-                    # if a == 'SVD-Z':
-                    U_GT, S1_GT,V_GT = decompose_SVDZ(GTE.cpu())
-                    #
-                    mask = errors[b] < 20
-                    mask[0] = True 
-                    m = data['models'][b][mask].cpu().double()
-                    # augment
-                    if False:
-                        U,s,Vh = torch.linalg.svd(m) # [3,3]
-                        S = torch.diag_embed(s)
-                        mm = []
-                        for R in RR:
-                            # recompose
-                            m = U @ R @ S @ Vh
-                            mm.append(m)
-                        mm = torch.cat(mm, axis=0)
-                        models[b] = mm
-                    # decompose each model
-                    mm = []
-                    for mi in m:
-                        U, S1_mi, V = decompose_SVDZ(mi)
-                        mhat = U @ S1_GT @ V
-                        # mhat = U_GT @ S1_GT @ R2
-                        # mm.append(torch.tensor(mi))
-                        mm.append(torch.tensor(mhat))
-                    mm = torch.stack(mm, axis = 0)
-                    models[b] = mm
-                    max_models = max(max_models, models[b].shape[0])
-                for b in range(C.shape[0]):
-                    models[b] = torch.cat([models[b], m.new_zeros((max_models - models[b].shape[0], 3, 3))])
-                models = torch.stack(models) # stack along batch dim
-                # models = torch.tensor(models).to(dtype=torch.float32).cuda()
-                data['models'] = models.cuda()
-                errors, _, _ = pose_error_batch_torch(data['models'], data)
+#             if False:
+#                 # pre-filter models
+#                 models = [None] * C.shape[0]
+#                 max_models = 0
+#                 # theta = np.linspace(-2,2,9,endpoint=True)/180*math.pi
+#                 theta = np.linspace(-0.5,0.5,9,endpoint=True)/180*math.pi
+#                 RR = torch.tensor(TR.from_euler('Z', theta).as_matrix()).float().cuda()
+#                 #    
+#                 for b in range(C.shape[0]):
+#                     # extract SVDZ from GT
+#                     # GTE = GTEs[b]
+#                     gt_R = to_tensor(data['gt_R'])[b]
+#                     gt_T = to_tensor(data['gt_t'])[b].squeeze(-1)
+#                     GTE = LO.compose_essential_matrix(gt_R, gt_T)
+#                     # Tp = gt_T
+#                     # Rp = gt_R
+#                     # if a == 'SVD-Z':
+#                     U_GT, S1_GT,V_GT = decompose_SVDZ(GTE.cpu())
+#                     #
+#                     mask = errors[b] < 20
+#                     mask[0] = True 
+#                     m = data['models'][b][mask].cpu().double()
+#                     # augment
+#                     if False:
+#                         U,s,Vh = torch.linalg.svd(m) # [3,3]
+#                         S = torch.diag_embed(s)
+#                         mm = []
+#                         for R in RR:
+#                             # recompose
+#                             m = U @ R @ S @ Vh
+#                             mm.append(m)
+#                         mm = torch.cat(mm, axis=0)
+#                         models[b] = mm
+#                     # decompose each model
+#                     mm = []
+#                     for mi in m:
+#                         U, S1_mi, V = decompose_SVDZ(mi)
+#                         mhat = U @ S1_GT @ V
+#                         # mhat = U_GT @ S1_GT @ R2
+#                         # mm.append(torch.tensor(mi))
+#                         mm.append(torch.tensor(mhat))
+#                     mm = torch.stack(mm, axis = 0)
+#                     models[b] = mm
+#                     max_models = max(max_models, models[b].shape[0])
+#                 for b in range(C.shape[0]):
+#                     models[b] = torch.cat([models[b], m.new_zeros((max_models - models[b].shape[0], 3, 3))])
+#                 models = torch.stack(models) # stack along batch dim
+#                 # models = torch.tensor(models).to(dtype=torch.float32).cuda()
+#                 data['models'] = models.cuda()
+#                 errors, _, _ = pose_error_batch_torch(data['models'], data)
             
-            # residuals
-            start1.record()
-            compute_residuals(data)
-            end1.record()
-            torch.cuda.synchronize()
-            dtS += start1.elapsed_time(end1)/1000
-            R = data['residuals']
-            for W in methods:
-                start0.record()
-                if isinstance(W, MethodGT):  # GT
-                    best_models = GTEs # GT [B,3,3]
-                    best_s = best_models.new_zeros(best_models.shape[0]) # [B]
-                else:
-                    if isinstance(W, Oracle):  # oracle errors
-                        # oracle has access to GT error function
-                        best_s, best_idx = (-errors).max(dim=-1)
-                    else:
-                        if o.kde: 
-                            scores = W.score_residuals(R, reduction=None)
-                            scores = (scores*data['kde_weights'].to(scores)).sum(dim=-1)
-                        else:
-                            scores = W.score_residuals(R)
-                        best_s, best_idx = scores.max(dim=1) # [B]
+#             # residuals
+#             start1.record()
+#             compute_residuals(data)
+#             end1.record()
+#             torch.cuda.synchronize()
+#             dtS += start1.elapsed_time(end1)/1000
+#             R = data['residuals']
+#             for W in methods:
+#                 start0.record()
+#                 if isinstance(W, MethodGT):  # GT
+#                     best_models = GTEs # GT [B,3,3]
+#                     best_s = best_models.new_zeros(best_models.shape[0]) # [B]
+#                 else:
+#                     if isinstance(W, Oracle):  # oracle errors
+#                         # oracle has access to GT error function
+#                         best_s, best_idx = (-errors).max(dim=-1)
+#                     else:
+#                         if o.kde: 
+#                             scores = W.score_residuals(R, reduction=None)
+#                             scores = (scores*data['kde_weights'].to(scores)).sum(dim=-1)
+#                         else:
+#                             scores = W.score_residuals(R)
+#                         best_s, best_idx = scores.max(dim=1) # [B]
                         
-                    best_s = best_s.cpu()
-                    best_idx = best_idx.cpu()
-                    best_models = select_dim1(data['models'], best_idx) 
-                # checker = Failure()
-                # pre_score_count, selection_failure, degenerate = checker.check(data['correspondences'], data['errors'][:, :-1], data['num_pts'], best_idx)
-                # print(pre_score_count)
-                # import pdb; pdb.set_trace()  
-                end0.record()
-                torch.cuda.synchronize()
-                dt2 += start0.elapsed_time(end0)/1000
-                # so-far-the-best
-                for b in range(C.shape[0]):
-                    if best_s[b] > res[(W,0)].best_s[b]:
-                        res[(W,0)].best_s[b] = best_s[b]
-                        res[(W,0)].best_M[b] = best_models[b]
-                # polish selected so-far-the-best with polish methods
-                for p in polishes:
-                    record = False
-                    if p == 0:
-                        best_models = res[(W,0)].best_M
-                        record = True
-                    elif (m_batch == 0 or (m_batch+1) % 5 == 0): # apply polish sparsely
-                        if W.name  == 'GaU' or (W.name  == 'Oracle' and p == 'GaU') or (W.name  == 'GT' and (m_batch == 0 or p == 'GaU')):
-                            # print(W.name, p, m_batch)
-                            start0.record()
-                            best_models, best_s = local_optimization(data, res[(W,0)].best_M, p)
-                            end0.record()
-                            torch.cuda.synchronize()
-                            dtp += start0.elapsed_time(end0)/1000
-                            # Evaluate LO optimized so-far-the-best
-                            # end0.record()
-                            record = True
+#                     best_s = best_s.cpu()
+#                     best_idx = best_idx.cpu()
+#                     best_models = select_dim1(data['models'], best_idx) 
+#                 # checker = Failure()
+#                 # pre_score_count, selection_failure, degenerate = checker.check(data['correspondences'], data['errors'][:, :-1], data['num_pts'], best_idx)
+#                 # print(pre_score_count)
+#                 # import pdb; pdb.set_trace()  
+#                 end0.record()
+#                 torch.cuda.synchronize()
+#                 dt2 += start0.elapsed_time(end0)/1000
+#                 # so-far-the-best
+#                 for b in range(C.shape[0]):
+#                     if best_s[b] > res[(W,0)].best_s[b]:
+#                         res[(W,0)].best_s[b] = best_s[b]
+#                         res[(W,0)].best_M[b] = best_models[b]
+#                 # polish selected so-far-the-best with polish methods
+#                 for p in polishes:
+#                     record = False
+#                     if p == 0:
+#                         best_models = res[(W,0)].best_M
+#                         record = True
+#                     elif (m_batch == 0 or (m_batch+1) % 5 == 0): # apply polish sparsely
+#                         if W.name  == 'GaU' or (W.name  == 'Oracle' and p == 'GaU') or (W.name  == 'GT' and (m_batch == 0 or p == 'GaU')):
+#                             # print(W.name, p, m_batch)
+#                             start0.record()
+#                             best_models, best_s = local_optimization(data, res[(W,0)].best_M, p)
+#                             end0.record()
+#                             torch.cuda.synchronize()
+#                             dtp += start0.elapsed_time(end0)/1000
+#                             # Evaluate LO optimized so-far-the-best
+#                             # end0.record()
+#                             record = True
                     
-                    if record:
-                        start0.record()
-                        # compute test error of the best found models
-                        best_e, best_r, best_t = pose_error_batch_torch(best_models.unsqueeze(1), data)  # [B]
-                        best_e = best_e.squeeze(-1).cpu().numpy()
-                        best_r = best_r.squeeze(-1).cpu().numpy()
-                        best_t = best_t.squeeze(-1).cpu().numpy()
-                        end0.record()
+#                     if record:
+#                         start0.record()
+#                         # compute test error of the best found models
+#                         best_e, best_r, best_t = pose_error_batch_torch(best_models.unsqueeze(1), data)  # [B]
+#                         best_e = best_e.squeeze(-1).cpu().numpy()
+#                         best_r = best_r.squeeze(-1).cpu().numpy()
+#                         best_t = best_t.squeeze(-1).cpu().numpy()
+#                         end0.record()
                     
-                        mp = (W,p)
-                        res[mp].running_s += [res[mp].best_s + 0]  # copy
-                        res[mp].running_e += [best_e]
-                        res[mp].running_r += [best_r]
-                        res[mp].running_t += [best_t]
-                        res[mp].running_M += [res[mp].best_M.cpu().numpy()]
-                        torch.cuda.synchronize()
-                        dt3 += start0.elapsed_time(end0)/1000
-                # Polish
-                # if polish != 0 and W.name in ['GaU','Oracle'] and (m_batch == 0 or (m_batch+1) % 5 == 0): # only occasionally reoptimize current best_M
-                #     start0.record()
-                #     best_models, best_s = local_optimization(data, res[W].best_M, polish)
-                #     # res[W].best_M = best_models # avoid repeatedly re-optimizing
-                #     end0.record()
-                #     torch.cuda.synchronize()
-                #     dtp += start0.elapsed_time(end0)/1000
-                #     # Evaluate LO optimized so-far-the-best
-                #     start0.record()
-                #     best_e, best_r, best_t = pose_error_batch_torch(best_models.unsqueeze(1), data)  # [B]
-                #     # end0.record()
-                # else:
-                #     # Evaluate selected so-far-the-best
-                #     start0.record()
-                #     best_e, best_r, best_t = pose_error_batch_torch(res[W].best_M.unsqueeze(1), data)  # [B]
-                #     # end0.record()
-                #
-                # best_e = best_e.squeeze(-1).cpu().numpy()
-                # best_r = best_r.squeeze(-1).cpu().numpy()
-                # best_t = best_t.squeeze(-1).cpu().numpy()
+#                         mp = (W,p)
+#                         res[mp].running_s += [res[mp].best_s + 0]  # copy
+#                         res[mp].running_e += [best_e]
+#                         res[mp].running_r += [best_r]
+#                         res[mp].running_t += [best_t]
+#                         res[mp].running_M += [res[mp].best_M.cpu().numpy()]
+#                         torch.cuda.synchronize()
+#                         dt3 += start0.elapsed_time(end0)/1000
+#                 # Polish
+#                 # if polish != 0 and W.name in ['GaU','Oracle'] and (m_batch == 0 or (m_batch+1) % 5 == 0): # only occasionally reoptimize current best_M
+#                 #     start0.record()
+#                 #     best_models, best_s = local_optimization(data, res[W].best_M, polish)
+#                 #     # res[W].best_M = best_models # avoid repeatedly re-optimizing
+#                 #     end0.record()
+#                 #     torch.cuda.synchronize()
+#                 #     dtp += start0.elapsed_time(end0)/1000
+#                 #     # Evaluate LO optimized so-far-the-best
+#                 #     start0.record()
+#                 #     best_e, best_r, best_t = pose_error_batch_torch(best_models.unsqueeze(1), data)  # [B]
+#                 #     # end0.record()
+#                 # else:
+#                 #     # Evaluate selected so-far-the-best
+#                 #     start0.record()
+#                 #     best_e, best_r, best_t = pose_error_batch_torch(res[W].best_M.unsqueeze(1), data)  # [B]
+#                 #     # end0.record()
+#                 #
+#                 # best_e = best_e.squeeze(-1).cpu().numpy()
+#                 # best_r = best_r.squeeze(-1).cpu().numpy()
+#                 # best_t = best_t.squeeze(-1).cpu().numpy()
                 
-                # if polish == 0 and False:
-                #     # DEBUG
-                #     best_e1, best_r1, best_t1 = pose_error_batch(res[W].best_M.unsqueeze(1).cpu().numpy(), data)  # [B]
-                #     assert(np.abs(best_r1 - best_r).max() < 0.1)
-                #     assert(np.abs(best_t1 - best_t).max() < 0.1)
-                #     assert(np.abs(best_e1 - best_e).max() < 0.1)
-                # end0.record()
+#                 # if polish == 0 and False:
+#                 #     # DEBUG
+#                 #     best_e1, best_r1, best_t1 = pose_error_batch(res[W].best_M.unsqueeze(1).cpu().numpy(), data)  # [B]
+#                 #     assert(np.abs(best_r1 - best_r).max() < 0.1)
+#                 #     assert(np.abs(best_t1 - best_t).max() < 0.1)
+#                 #     assert(np.abs(best_e1 - best_e).max() < 0.1)
+#                 # end0.record()
                 
                 
-        print(f'Timing: Solver: {dt1:3.2f}', f'Residuals: {dtS:3.2f}', f'Oracle: {dtg:3.2f}', f'Scoring: {dt2:3.2f}', f'Ploish: {dtp:3.2f}', f'Eval: {dt3:3.2f}')
-        if idx % 10 == 0:
-            print(idx)
-        # concatenate runing results
-        for mp in itertools.product(methods, polishes):
-            running_s = npstack(res[mp].running_s).swapaxes(0,1)
-            running_e = npstack(res[mp].running_e).swapaxes(0,1)
-            running_r = npstack(res[mp].running_r).swapaxes(0,1)
-            running_t = npstack(res[mp].running_t).swapaxes(0,1)
-            running_M = npstack(res[mp].running_M).swapaxes(0,1)
-            eval_results[mp].running_s += [running_s]
-            eval_results[mp].running_e += [running_e]
-            eval_results[mp].running_r += [running_r]
-            eval_results[mp].running_t += [running_t]
-            eval_results[mp].running_M += [running_M]
-        # if idx > 0:
-        #     break
-    # concatenate over batches
-    for mp in itertools.product(methods, polishes):
-        for k in eval_results[mp].keys():
-            if len(eval_results[mp][k]) > 0:
-                eval_results[mp][k] = np.concatenate(eval_results[mp][k], axis=0)
-    return eval_results, files
+#         print(f'Timing: Solver: {dt1:3.2f}', f'Residuals: {dtS:3.2f}', f'Oracle: {dtg:3.2f}', f'Scoring: {dt2:3.2f}', f'Ploish: {dtp:3.2f}', f'Eval: {dt3:3.2f}')
+#         if idx % 10 == 0:
+#             print(idx)
+#         # concatenate runing results
+#         for mp in itertools.product(methods, polishes):
+#             running_s = npstack(res[mp].running_s).swapaxes(0,1)
+#             running_e = npstack(res[mp].running_e).swapaxes(0,1)
+#             running_r = npstack(res[mp].running_r).swapaxes(0,1)
+#             running_t = npstack(res[mp].running_t).swapaxes(0,1)
+#             running_M = npstack(res[mp].running_M).swapaxes(0,1)
+#             eval_results[mp].running_s += [running_s]
+#             eval_results[mp].running_e += [running_e]
+#             eval_results[mp].running_r += [running_r]
+#             eval_results[mp].running_t += [running_t]
+#             eval_results[mp].running_M += [running_M]
+#         # if idx > 0:
+#         #     break
+#     # concatenate over batches
+#     for mp in itertools.product(methods, polishes):
+#         for k in eval_results[mp].keys():
+#             if len(eval_results[mp][k]) > 0:
+#                 eval_results[mp][k] = np.concatenate(eval_results[mp][k], axis=0)
+#     return eval_results, files
 
 
-# _________Load models______________
-# %% Load modes
-print('________Loading models___________')
+
+# %%  _________Construct / Load models______________
+print('________Construct / Load models___________')
 max_distance = 10; N_bins = 500 # filter to select models to evaluate
 methods = []
-files = os.listdir(model_path)
-mdict = dict()
-for file in files:
-    W = None
-    f = os.path.abspath(os.path.join(model_path, file))
-    if file.endswith(".pkl"):
-        W = torch.load(f, weights_only=False)
-        # if isinstance(W, ScoreWeightsMonotoneMix):
-            # continue
-        if isinstance(W, ScoreWeightsTZ):
-            continue
-        if isinstance(W, ScoreWeightsRANSAC): # will add manually
-            continue        
-        if isinstance(W, ScoreWeightsMSAC): # will add manually
-            continue
-        # if isinstance(W, ScoreWeightsMonotoneMix): # skip
-            # continue
-        if isinstance(W, ScoreWeightsMAGSAC): # will add manually
-            continue
-        # if isinstance(W, ScoreWeightsMonotoneMix) and W.alpha > 0.1 and not hasattr(W, 'M'):
-            # continue        
-        if not hasattr(W, 'pow'):
-            W.pow = 1
-        W.name = file.replace('.pkl', '').replace('magsac', 'MAGSAC++').replace('ransac', 'RANSAC').replace(
-            'msac', 'MSAC').replace('_', ' ').replace('bins=500','').replace('tau=10.0','').replace('alpha','gamma')
-        # W.name = W.name.split(' ')[0]
-        W.file = file
-        print(W.name + ',\t max_distance=' + str(W.max_distance))
-        if not hasattr(W,'M'):
-            W.gen_hyperparams(o.val_thresholds)
-            M = W.score_matrix()
-            W.register_buffer('M', M)
-        else:
-            print('loaded M for ' + W.name)
-        W.cuda()
-        mdict[W.name] = W
-        methods.append(W)
-
-methods = []
-
-# Add MAGSAC-10
-# W = ScoreWeightsMAGSAC(maximum_threshold=10, N_bins=methods[0].N_bins, max_distance=methods[0].max_distance)
-# W.pow = 1
-# W.val_w = W.score_weights_normalized().cuda()
-# W.locked = True
-# W.name = 'MAGSAC++ (tau=10)'
-# methods += [W]
-
-# # Add TZ
-# W = ScoreWeightsTZ(N_bins=methods[0].N_bins, max_distance=max_distance, alpha=None, max_outlier_dist=100.0, pow=1)
-# W.name = 'TZ'
-# W.cuda()
-# W.gen_hyperparams(o.val_thresholds)
-# M = W.score_matrix()
-# W.register_buffer('M', M)
-# methods += [W]
 
 # Add GU
 W = ScoreWeightsGU(N_bins=N_bins, max_distance=max_distance, pow=1)
@@ -1053,15 +640,6 @@ W.register_buffer('M', M)
 WGU = W
 methods += [W]
 
-# Add GaU
-# W = ScoreWeightsGaU(N_bins=N_bins, max_distance=max_distance, pow=1)
-# W.name = 'Marg-GaU'
-# W.cuda()
-# W.gen_hyperparams(o.val_thresholds)
-# M = W.score_matrix()
-# W.register_buffer('M', M)
-# # methods += [W]
-
 # # Add MSAC
 W = ScoreWeightsMSAC(N_bins=N_bins, max_distance=max_distance, pow=1)
 W.name = 'MSAC'
@@ -1072,17 +650,8 @@ W.register_buffer('M', M)
 methods += [W]
 WMSAC = W
 
-# # Add RANSAC-locked
-# W = ScoreWeightsRANSAC(N_bins=N_bins, max_distance=max_distance, pow=1, tau = 3.0)
-# W.pow = 1
-# W.gen_hyperparams(o.val_thresholds)
-# W.val_w = W.score_weights_normalized().cuda()
-# W.locked = True
-# W.name = 'RANSAC(3)'
-# methods += [W]
-
 # # Add MAGSAC++
-W = ScoreWeightsMAGSAC(N_bins=N_bins, max_distance=max_distance)
+W = ScoreWeightsMAGSAC(N_bins=N_bins, max_distance=max_distance, dof =o.MAGSAC_dof)
 W.name = 'MAGSAC++'
 W.pow = 1
 W.cuda()
@@ -1099,31 +668,10 @@ W.gen_hyperparams(o.val_thresholds)
 M = W.score_matrix()
 W.register_buffer('M', M)
 methods += [W]
-#
-# #
-for k in mdict.keys():
-    if 'ML' in k:
-        methods += [mdict[k]]
-
-# add remaining
-for k in mdict.keys():
-    if mdict[k] not in methods:
-        methods += [mdict[k]]
+# TODO: Add loaded (learned) models
 
 # Add Oracle and GT
 methods += [Oracle(N_bins=N_bins, max_distance=max_distance, pow=1), MethodGT(N_bins=N_bins, max_distance=max_distance, pow=1)]
-
-# if Eval_GCMAGSAC:
-#     # need validated WMSAC and WGU models
-#     load_methods = load_object(results_file0)
-#     for M in load_methods:
-#         if M.name == 'MSAC':
-#             WMSAC = M
-#         if M.name == 'GaU':
-#             WGU = M
-#     W = GCMAGSAC(N_bins=N_bins, max_distance=max_distance, pow=1)
-#     methods = [W]
-#     val_scenes = []
 
 [print(m.name) for m in methods]
 
@@ -1154,8 +702,9 @@ if validate:
         val_src_name = val_src.replace('/','_')
         print(f'__Validation on {val_src}___________')
         torch.manual_seed(1)
-        dataset = ResidualData(dataset_info, val_src, padding=True) # padding the 
-        loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, num_workers=0, shuffle=True)
+        # dataset = ResidualData(dataset_info, val_src, padding=True) # padding the 
+        # dataset = H_dataset(dataset_info, val_src, padding=True)
+        loader = create_loader(val_src)
         eval_results = evaluate(loader, 'val')
         for M in methods:
             M.best_e += [eval_results[M].best_e]

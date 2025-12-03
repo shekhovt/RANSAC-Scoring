@@ -4,3 +4,12 @@ results/
 fig/
 PoseLib_1/
 data/
+trash/
+*.pyc
+*.pkl
+*.pth
+*.npy
+*.npz
+*.log
+*.csv
+*.h5
