@@ -9,7 +9,7 @@ import kornia
 import cv_utils
 import cv2
 
-from .decompose_homography import decompose_homography_mat, is_homography_ill_conditioned
+from .decompose_homography import decompose_homography_mat, decompose_homography_stable, is_decomposition_numerically_unstable, is_homography_ill_conditioned, decompose_homography_robust, validate_homography_cheirality
 
 #_______________________ Sampson error (batched/unbatched) _____________________________
 
@@ -162,7 +162,7 @@ def solve_homography(x1, x2):
         HH = []
         II = []
         for i in range(m_batch_size):
-            H = poselib.homography_4pt(x1[i], x2[i]) # Does 4pt always has at most one solution?
+            H = poselib.homography_4pt(x1[i], x2[i], check_cheirality = True) # Does 4pt always has at most one solution?
             if H is not None:
                 HH.extend([H])
                 II.extend([i])
@@ -200,9 +200,11 @@ def new_minimal_models(data, m_batch_size, max_average_sol=None, include_GT=Fals
             E, I = solver(x1,y1)
             E = torch.tensor(E)
             I = torch.tensor(I)
-            invalid, _ = is_homography_ill_conditioned(E, threshold = 100)
-            EE.extend(E[~invalid].tolist())
-            II.extend(I[~invalid].tolist())
+            valid, E = validate_homography_cheirality(E, xx[b,:n,:2], yy[b,:n,:2], threshold = 0.01)
+            ill, _ = is_homography_ill_conditioned(E, threshold = 100)
+            mask = ~ill & valid
+            EE.extend(E[mask].tolist())
+            II.extend(I[mask].tolist())
         # print(f"Loop for batch {b} took {elapsed_time:.4f} seconds")
 
         # get the required number of valid models
@@ -318,7 +320,7 @@ def new_minimal_models_H(data, m_batch_size, max_average_sol=None, include_GT=Fa
 #     normalizedHomography = np.linalg.inv(K2).dot(H1to2).dot(K1)
 
 
-def pose_error_batch_torch(models, data, method = 'cv2'):
+def pose_error_batch_torch(models, data, method = 'torch'):
     """
     Docstring for pose_error
     
@@ -338,7 +340,7 @@ def pose_error_batch_torch(models, data, method = 'cv2'):
     Err_R = torch.zeros((B, M), dtype=models.dtype, device=models.device)
     # Decompose using torch
     if method == 'torch':
-        BRs, Bts, Bnormals = decompose_homography_mat(models) # [B, M, num, 3, 3], [B, M, num, 3], [B, M, num, 3]
+        BRs, Bts, Bnormals, _ = decompose_homography_robust(models, s3_threshold = 0.01) # [B, M, num, 3, 3], [B, M, num, 3], [B, M, num, 3]
         num = 4
         for b in range(B):
             err_R_sm = torch.zeros((num,M), dtype=models.dtype, device=models.device)
@@ -383,7 +385,7 @@ def pose_error_batch_torch(models, data, method = 'cv2'):
                     err_t = min(err_t, e_t)
 
                 if True: # DEBUG:
-                    Rs1, ts1, normals1 = decompose_homography_mat(models[b,m].cpu().double())
+                    Rs1, ts1, normals1, _ = decompose_homography_robust(models[b,m].cpu().double())
                     num = 4
                     err_R1 = 180.0
                     err_t1 = 180.0
@@ -396,9 +398,11 @@ def pose_error_batch_torch(models, data, method = 'cv2'):
                     diff_t = abs(err_t - err_t1)
                     if diff_R > 1e-4 or diff_t > 1e-4:
                         print(f"Large difference between cv2 and torch decomposition for batch {b} model {m}: err_R diff = {diff_R}, err_t diff = {diff_t}")
-                        print(models[b,m].cpu().numpy())
+                        print('homography candidate:', models[b,m].cpu().numpy())
+                        print('GT:', gt_R[b].cpu().numpy())
                         f,c = is_homography_ill_conditioned(models[b,m].cpu().double(), threshold = 100)
-                        print('Condition number:', c)
+                        _, s3 = is_decomposition_numerically_unstable(models[b,m].cpu().double())
+                        print(f'Condition number: {c} s3={s3}')
                         print("---")
 
                 err_e = max(err_R, err_t)
