@@ -36,6 +36,8 @@ from .metrics import * #ARO_candidates, pose_error_EE, pose_error_EERT
 from .depreicated.aro import * #ARO_candidates, pose_error_EE, pose_error_EERT
 from . import local_optimization as LO
 from .drawing import *
+from .model import AUC_10
+from .model_E import new_minimal_models, pose_error_batch_torch
 
 
 op = ArgumentParser()
@@ -56,7 +58,7 @@ op.add_argument("--kde", action='store_true', default=False, help="running test"
 op.add_argument("--geom", action='store_true', default=False, help="error geometry analysis")
 op.add_argument("--inliers", action='store_true', default=False, help="inliers statistics experiment")
 op.add_argument("--static", action='store_true', default=False, help="static 1K test, DEPRICATED")
-op.add_argument("--var", type=bool, default=True, help="variance test")
+op.add_argument("--var", action='store_true', default=False, help="variance test")
 op.add_argument("--F", action='store_true', default=False, help="use solver for F matrix (regardless of the dataset)")
 op.add_argument("--new_models", type=bool, default=True, help="sample new models for validation instead of saved ones")
 
@@ -65,13 +67,16 @@ ops, args = op.parse_known_args(shlex.split(args_str))
 o = SimpleNamespace(**vars(ops))
 ## 
 ## For interactove model
-o.validate = True
+# o.validate = True
 # o.F = True
 # o.geom = True
 # o.inliers = True
 # o.R = True
 # o.var = True
-o.var = False
+# o.var = False
+# o.validate = True
+o.running = True
+# o.recompute = True
 ##
 ##
 
@@ -106,9 +111,9 @@ o.F = (dataset_info.Fundamental or o.F)
 
 Eval_GCMAGSAC = False
 
-# val_scenes = dataset_info.val
+val_scenes = dataset_info.val
 # val_scenes = dataset_info.test
-val_scenes = dataset_info.val[3:4]
+# val_scenes = dataset_info.val[3:4]
 # test_scenes = dataset_info.test #[7:8]
 test_scenes = dataset_info.test
 res_root = f'results/{dataset_info.name}/'
@@ -214,41 +219,41 @@ def local_optimization(data, models, polish):
         raise AttributeError(f'Polish method {polish} unrecognized')
 
 
-def new_minimal_models(data, m_batch_size, max_average_sol=None, include_GT=False):
-    C = data['correspondences'] # [B, max_N, 4]
-    xx = torch.cat([C[..., :2], C.new_ones(list(C.shape[:-1]) + [1])], dim=-1)
-    yy = torch.cat([C[..., 2:], C.new_ones(list(C.shape[:-1]) + [1])], dim=-1)
-    n_points = data['num_pts']
-    max_models = 0
-    models = [[] for b in range(C.shape[0])]
-    for b in range(C.shape[0]):
-        n = n_points[b]
-        log_p = (C.new_ones((n,))/n).log()
-        ii = sample_subsets(5, log_p, m_batch_size)
-        x1 = xx[b,:n][ii,:].cpu().numpy().astype(float)
-        y1 = yy[b,:n][ii, :].cpu().numpy().astype(float)
-        EE = solve_epipolar(x1,y1)
-        n_models = len(EE)
-        max_models = max(max_models, n_models)
-        models[b] = EE
-    # assert(max_models > 1000)
-    if max_average_sol is not None:
-        max_models = min(max_models, m_batch_size*max_average_sol)
-    for b in range(C.shape[0]):
-        if len(models[b]) > max_models:
-            models[b] = models[b][:max_models]
-        else:
-            models[b] = np.concatenate([np.stack(models[b]), np.zeros((max_models - len(models[b]), 3, 3))])
-    models = np.stack(models) # stack along batch dim
-    models = torch.tensor(models).to(dtype= torch.float32).cpu()
-    #
-    # data['models'][:,:1000] = models # use 1K models
-    if include_GT:
-        GTmodels = data['models'][:,-1:].to(models)
-        models = torch.cat([models, GTmodels], dim = 1)
-    data['models'] = models
-    # errors, _, _ = pose_error_batch_torch(data['models'][:,:-1], data)
-    # data['errors'][:,:1000] = errors
+# def new_minimal_models(data, m_batch_size, max_average_sol=None, include_GT=False):
+#     C = data['correspondences'] # [B, max_N, 4]
+#     xx = torch.cat([C[..., :2], C.new_ones(list(C.shape[:-1]) + [1])], dim=-1)
+#     yy = torch.cat([C[..., 2:], C.new_ones(list(C.shape[:-1]) + [1])], dim=-1)
+#     n_points = data['num_pts']
+#     max_models = 0
+#     models = [[] for b in range(C.shape[0])]
+#     for b in range(C.shape[0]):
+#         n = n_points[b]
+#         log_p = (C.new_ones((n,))/n).log()
+#         ii = sample_subsets(5, log_p, m_batch_size)
+#         x1 = xx[b,:n][ii,:].cpu().numpy().astype(float)
+#         y1 = yy[b,:n][ii, :].cpu().numpy().astype(float)
+#         EE = solve_epipolar(x1,y1)
+#         n_models = len(EE)
+#         max_models = max(max_models, n_models)
+#         models[b] = EE
+#     # assert(max_models > 1000)
+#     if max_average_sol is not None:
+#         max_models = min(max_models, m_batch_size*max_average_sol)
+#     for b in range(C.shape[0]):
+#         if len(models[b]) > max_models:
+#             models[b] = models[b][:max_models]
+#         else:
+#             models[b] = np.concatenate([np.stack(models[b]), np.zeros((max_models - len(models[b]), 3, 3))])
+#     models = np.stack(models) # stack along batch dim
+#     models = torch.tensor(models).to(dtype= torch.float32).cpu()
+#     #
+#     # data['models'][:,:1000] = models # use 1K models
+#     if include_GT:
+#         GTmodels = data['models'][:,-1:].to(models)
+#         models = torch.cat([models, GTmodels], dim = 1)
+#     data['models'] = models
+#     # errors, _, _ = pose_error_batch_torch(data['models'][:,:-1], data)
+#     # data['errors'][:,:1000] = errors
 
 
 def new_minimal_models_F(data, m_batch_size, max_average_sol=None, include_GT=False):
@@ -700,13 +705,13 @@ else:
 def npstack(arrays):
     return np.stack(arrays) if len(arrays)>0 else np.zeros(shape =(0,0))
 
-def solve_epipolar(x1, x2):
-        m_batch_size = x1.shape[0]
-        EE = []
-        for i in range(m_batch_size):
-            E = poselib.essential_matrix_5pt(x1[i], x2[i])
-            EE.extend(E)
-        return EE
+# def solve_epipolar(x1, x2):
+#         m_batch_size = x1.shape[0]
+#         EE = []
+#         for i in range(m_batch_size):
+#             E = poselib.essential_matrix_5pt(x1[i], x2[i])
+#             EE.extend(E)
+#         return EE
 
 def test_running(loader):
     global methods
@@ -1012,6 +1017,8 @@ for file in files:
         W.name = file.replace('.pkl', '').replace('magsac', 'MAGSAC++').replace('ransac', 'RANSAC').replace(
             'msac', 'MSAC').replace('_', ' ').replace('bins=500','').replace('tau=10.0','').replace('alpha','gamma')
         # W.name = W.name.split(' ')[0]
+        if isinstance(W, ScoreWeightsMonotoneMix) and 'gamma=30.0' in W.name: # keep only on ML model in evaluations
+            continue        
         W.file = file
         print(W.name + ',\t max_distance=' + str(W.max_distance))
         if not hasattr(W,'M'):
@@ -1190,8 +1197,8 @@ if validate:
         for (i,W) in enumerate(methods):
             if W.name == 'GT':
                 continue
-            if 'gamma=30.0' in W.name:
-                continue
+            # if 'gamma=30.0' in W.name:
+                # continue
             # if hasattr(W,'locked'):
                 # continue
             # if 'ML' in W.name: # or 'TZ' in W.name: #  and not 'mult' in W.name:
@@ -1285,8 +1292,8 @@ if validate:
     for (i,W) in enumerate(methods):
         if hasattr(W, 'locked'):
             continue
-        if 'gamma=30.0' in W.name:
-                continue
+        # if 'gamma=30.0' in W.name: # What's the problem, we still search a hyperparam for it??
+                # continue
         # if 'ML' in W.name and 'mult' in W.name:
             # continue
         # w = W.score_weights_normalized()
@@ -1432,6 +1439,7 @@ if o.running:
 
 
     # plot resutls
+    #!!!! plots are in running_plots.py
 
     # f = plt.figure()
     # for M in methods:

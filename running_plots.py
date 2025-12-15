@@ -23,14 +23,16 @@ dname = os.path.dirname(abspath)
 os.chdir(dname)
 
 
-# dataset_info = PhotoTourismRootSIFT
+dataset_info = PhotoTourismRootSIFT
 # dataset_info = PhotoTourismSPSG
 # dataset_info = ETH3D
 # dataset_info = LAMAR
-dataset_info = KITTI
-err = 'running_r'
+# dataset_info = KITTI
+# err = 'running_r'
+err = 'running_e'
 selected = ['GaU', 'MSAC', 'MAGSAC++', 'RANSAC', 'ML   gamma=10.0', 'Oracle', 'GT']
-polishes = [0, 'GaU', 'TRUNCATED', 'TRUNCATED_LE_ZACH']
+#polishes = [0, 'GaU', 'TRUNCATED', 'TRUNCATED_LE_ZACH']
+polishes = [0] 
 
 res_root = f'results/{dataset_info.name}/'
 out = res_root + f'results.txt'

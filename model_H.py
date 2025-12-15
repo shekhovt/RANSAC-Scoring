@@ -1,15 +1,21 @@
 import torch
 
+import model
+
+__name__ = 'score_learn.model_H.py'
+__package__ = 'score_learn'
+
 import numpy as np
 
 from .functional import *
-from .metrics import R_error, t_error
 import poselib
 import kornia
 import cv_utils
 import cv2
 
-from .decompose_homography import decompose_homography_mat, decompose_homography_stable, is_decomposition_numerically_unstable, is_homography_ill_conditioned, decompose_homography_robust, validate_homography_cheirality
+from .decompose_homography import decompose_homography_mat, is_homography_ill_conditioned, validate_homography_cheirality
+from .import model
+from .model import normalize_points, unnormalize_points, R_error, t_error
 
 #_______________________ Sampson error (batched/unbatched) _____________________________
 
@@ -25,6 +31,12 @@ def Sampson(x, y, H):
     Returns:
         scalar Sampson error (not squared)
     """
+
+    # Normalize homogeneous coordinates to guard against arbitrary scale
+    if x.shape[0] == 3:
+        x = x / (x[2] + 1e-12)
+    if y.shape[0] == 3:
+        y = y / (y[2] + 1e-12)
 
     # Project x using H
     Hx = H @ x  # 3-vector
@@ -79,13 +91,13 @@ def SampsonBM(x, y, H, eps=1e-12):
     B, M, _, _ = H.shape
     _, n, _ = x.shape
 
+    # Normalize homogeneous coordinates to keep scale consistent
+    x_norm = x / (x[..., 2:3] + eps)
+    y_norm = y / (y[..., 2:3] + eps)
+
     # Expand x,y to match H:  [B, 1, n, 3] → [B, M, n, 3]
-    x_exp = x[:, None, :, :].expand(B, M, n, 3)
-    
-    # Normalize y to get inhomogeneous coordinates
-    y = y / y[..., 2:3]
-    # Expand y:  [B, 1, n, 3] → [B, M, n, 3]
-    y_exp = y[:, None, :, :].expand(B, M, n, 3)
+    x_exp = x_norm[:, None, :, :].expand(B, M, n, 3)
+    y_exp = y_norm[:, None, :, :].expand(B, M, n, 3)
 
     # Homography projection: H @ x
     # H: [B, M, 3, 3], x_exp: [B, M, n, 3]
@@ -125,10 +137,10 @@ def SampsonBM(x, y, H, eps=1e-12):
     Hx2 = Hx[..., 2]
 
     d_u_dx = (dHx_dx[..., 0, :] * Hx2.unsqueeze(-1)
-              - Hx0.unsqueeze(-1) * d_denom) / (Hx2.unsqueeze(-1) ** 2)
+              - Hx0.unsqueeze(-1) * d_denom) / (Hx2.unsqueeze(-1) ** 2 + eps)
 
     d_v_dx = (dHx_dx[..., 1, :] * Hx2.unsqueeze(-1)
-              - Hx1.unsqueeze(-1) * d_denom) / (Hx2.unsqueeze(-1) ** 2)
+              - Hx1.unsqueeze(-1) * d_denom) / (Hx2.unsqueeze(-1) ** 2 + eps)
 
     # J_x = - [ du/dx ; dv/dx ]  → [B,M,n,2,2]
     J_x = -torch.stack([d_u_dx, d_v_dx], dim=-2)
@@ -152,6 +164,65 @@ def SampsonBM(x, y, H, eps=1e-12):
 
     return (sampson_sq + eps)**0.5  # [B, M, n]
 
+
+def SymmetricReprojectionError(x, y, H, eps=1e-12):
+    """
+    Vectorized symmetric reprojection error for homographies.
+    
+    Computes: sqrt(||y - H*x||^2 + ||x - H^{-1}*y||^2)
+    
+    This is the standard symmetric transfer error used for homography estimation.
+    
+    Args:
+        H:  [B, M, 3, 3]   homography hypotheses
+        x:  [B, n, 3]      source points (homogeneous)
+        y:  [B, n, 3]      destination points (homogeneous)
+
+    Returns:
+        Symmetric reprojection errors: [B, M, n]
+    """
+    
+    B, M, _, _ = H.shape
+    _, n, _ = x.shape
+    
+    # Expand x,y to match H:  [B, 1, n, 3] → [B, M, n, 3]
+    x_exp = x[:, None, :, :].expand(B, M, n, 3)
+    y_exp = y[:, None, :, :].expand(B, M, n, 3)
+    
+    # Normalize to inhomogeneous coordinates
+    x_norm = x_exp / (x_exp[..., 2:3] + eps)
+    y_norm = y_exp / (y_exp[..., 2:3] + eps)
+    
+    # Forward: y_proj = H * x
+    # H: [B, M, 3, 3], x_exp: [B, M, n, 3]
+    Hx = (H[:, :, None, :, :] @ x_exp.unsqueeze(-1)).squeeze(-1)  # [B, M, n, 3]
+    y_proj = Hx / (Hx[..., 2:3] + eps)  # Normalize to inhomogeneous
+    
+    # Forward error: ||y - H*x||^2
+    forward_error_sq = ((y_norm[..., 0] - y_proj[..., 0])**2 + 
+                        (y_norm[..., 1] - y_proj[..., 1])**2)
+    
+    # Backward: x_proj = H^{-1} * y
+    # Compute H^{-1} for all homographies
+    try:
+        H_inv = torch.linalg.inv(H)  # [B, M, 3, 3]
+    except:
+        # Handle singular matrices
+        H_inv = torch.linalg.pinv(H)  # Use pseudo-inverse as fallback
+    
+    Hinv_y = (H_inv[:, :, None, :, :] @ y_exp.unsqueeze(-1)).squeeze(-1)  # [B, M, n, 3]
+    x_proj = Hinv_y / (Hinv_y[..., 2:3] + eps)  # Normalize to inhomogeneous
+    
+    # Backward error: ||x - H^{-1}*y||^2
+    backward_error_sq = ((x_norm[..., 0] - x_proj[..., 0])**2 + 
+                         (x_norm[..., 1] - x_proj[..., 1])**2)
+    
+    # Symmetric error: sqrt of sum of squared errors
+    symmetric_error = torch.sqrt(forward_error_sq + backward_error_sq + eps)
+    
+    return symmetric_error  # [B, M, n]
+
+
 #_______________________ minimal solvers___________________________________
 
 def solve_homography(x1, x2):
@@ -168,91 +239,132 @@ def solve_homography(x1, x2):
                 II.extend([i])
         return HH, II
 
-
-def new_minimal_models(data, m_batch_size, max_average_sol=None, include_GT=False, solver = solve_homography, min_sample=4):
+def validate_homography(E, mx, my, iii):
     """
-    Create new minimal models using minimal solver
-    Correspondences:
-    x [B, max_N, 3]
-    y [B, max_N, 3] 
+    E [N, 3 x 3] -- models
+    mx, my [n, 3] -- points
+    iii -- [N, 4] -- minimal samples corresponding to the models
     """
-    C = data['correspondences'] # [B, max_N, 4]
-    xx = C[..., :3]
-    xx = xx / xx[..., 2:3]
-    yy = C[..., 3:]
-    yy = yy / yy[..., 2:3]
-    # xx = torch.cat([C[..., :2], C.new_ones(list(C.shape[:-1]) + [1])], dim=-1)
-    # yy = torch.cat([C[..., 2:], C.new_ones(list(C.shape[:-1]) + [1])], dim=-1)
-    n_points = data['num_pts']
-    max_models = 0
-    models = [[] for b in range(C.shape[0])]
-    for b in range(C.shape[0]):
-        n = n_points[b]
-        log_p = (C.new_ones((n,))/n).log()
-        EE = []
-        II = []
-        
-        start_time = time.time()
-        while len(EE) < m_batch_size:
-            ii = sample_visible_subsets(min_sample, log_p, m_batch_size, xx[b,:n,:2], yy[b,:n,:2]) # [M, min_sample]
-            x1 = xx[b,:n][ii,:].cpu().numpy().astype(float)
-            y1 = yy[b,:n][ii, :].cpu().numpy().astype(float)
-            E, I = solver(x1,y1)
-            E = torch.tensor(E)
-            I = torch.tensor(I)
-            valid, E = validate_homography_cheirality(E, xx[b,:n,:2], yy[b,:n,:2], threshold = 0.01)
-            ill, _ = is_homography_ill_conditioned(E, threshold = 100)
-            mask = ~ill & valid
-            EE.extend(E[mask].tolist())
-            II.extend(I[mask].tolist())
-        # print(f"Loop for batch {b} took {elapsed_time:.4f} seconds")
+    valid, E, _ = validate_homography_cheirality(E, mx.double(), my.double(), iii)
+    # check ill-conditioning
+    ill, _ = is_homography_ill_conditioned(E, threshold = 100)
+    mask = ~ill & valid
+    return mask
 
-        # get the required number of valid models
-        EE = EE[:m_batch_size]
-        II = II[:m_batch_size]
 
-        if False and b==0: # DEBUG TEST
-            print('Indices of first model:', II[0])
-            x1 = xx[b,:n][ii[II[0]]].cpu()
-            y1 = yy[b,:n][ii[II[0]]].cpu()
-            M = torch.tensor(EE[0], dtype = x1.dtype)
-            reprojected_y1 = (M @ x1.T).T
-            reprojected_y1 = reprojected_y1 / reprojected_y1[:,2:3]
-            err = (reprojected_y1 - y1).norm(dim=1)
-            print('Reprojection errors of first model (px):', err)
-            r = SampsonBM(x1[None,:, :], y1[None,:, :], M[None, None, :, :])[0,0]
-            print('Sampson errors of first model in normalized coordinates:', r)
-            K1 = data['K1'][b].cpu()
-            K2 = data['K2'][b].cpu()
-            x1 = unnormalize_points(x1, K1)
-            y1 = unnormalize_points(y1, K2)
-            M = unnormalize_models(M[None,:,:], K1, K2)[0]
-            reprojected_y1 = (M @ x1.T).T
-            reprojected_y1 = reprojected_y1 / reprojected_y1[:,2:3]
-            err_px = (reprojected_y1 - y1).norm(dim=1)
-            print('Reprojection errors of first model (px):', err_px)
-            r = SampsonBM(x1[None,:, :], y1[None,:, :], M[None, None, :, :])[0,0]
-            print('Sampson errors of first model in pixel coordinates:', r)
+# def new_minimal_models(data, m_batch_size, max_average_sol=None, include_GT=False, solver = solve_homography, min_sample=4):
+#     """
+#     Create new minimal models using minimal solver
+#     Correspondences:
+#     x [B, max_N, 3]
+#     y [B, max_N, 3] 
+#     """
+#     C = data['correspondences'] # [B, max_N, 4]
+#     xx = C[..., :3]
+#     xx = xx / xx[..., 2:3]
+#     yy = C[..., 3:]
+#     yy = yy / yy[..., 2:3]
+#     # xx = torch.cat([C[..., :2], C.new_ones(list(C.shape[:-1]) + [1])], dim=-1)
+#     # yy = torch.cat([C[..., 2:], C.new_ones(list(C.shape[:-1]) + [1])], dim=-1)
+#     n_points = data['num_pts']
+#     max_models = 0
+#     models = [[] for b in range(C.shape[0])]
+#     for b in range(C.shape[0]):
+#         n = n_points[b]
+#         mx = xx[b,:n]
+#         my = yy[b,:n]
+#         # log_p = (C.new_ones((n,))/n).log() #uniform sampling
+#         # sampling probabilities based on SNN ratio, small SNN is better -> more likely to draw
+#         snn = data['snn'][b,:n]
+#         # what is the sigma of Normal distribution such that 95% of values are within [0,0.95]?
+#         sigma = 1/8.0
+#         p = torch.exp(-snn**2/(2*sigma**2)) + 1e-6
+#         # p = snn < 0.7 + 0.001 # hard thresholding
+#         log_p = (p / p.sum()).log() # convert to categorical distribution over all points and take log
+#         EE = []
+#         II = []
+#         start_time = time.time()
+#         max_iters = 10
+#         iter = 0
+#         if False:
+#             mask = snn < 0.7
+#             mx = mx[mask]
+#             my = my[mask]
+#             n = mx.shape[0]
+#             log_p = (C.new_ones((n,))/n).log() #uniform sampling
         
-        n_models = len(EE)
-        max_models = max(max_models, n_models)
-        models[b] = EE
-    # assert(max_models > 1000)
-    if max_average_sol is not None:
-        max_models = min(max_models, m_batch_size*max_average_sol)
-    for b in range(C.shape[0]):
-        if len(models[b]) > max_models:
-            models[b] = models[b][:max_models]
-        else:
-            models[b] = np.concatenate([np.stack(models[b]), np.zeros((max_models - len(models[b]), 3, 3))]) # pad models with zeros -- Ok for E but maybe not for H?
-    models = np.stack(models) # stack along batch dim
-    models = torch.tensor(models).to(dtype= torch.float32).cpu()
-    #
-    # data['models'][:,:1000] = models # use 1K models
-    if include_GT:
-        GTmodels = data['models'][:,-1:].to(models)
-        models = torch.cat([models, GTmodels], dim = 1)
-    data['models'] = models
+#         while len(EE) < m_batch_size and iter < max_iters and n >= min_sample:
+#             ii = sample_visible_subsets(min_sample, log_p, m_batch_size, mx, my) # [M, min_sample]
+#             x1 = mx[ii,:].cpu().numpy().astype(float) # [M, min_sample, 3] coordinates at minimal sample
+#             y1 = my[ii,:].cpu().numpy().astype(float) # [M, min_sample, 3]
+#             E, I = solver(x1,y1) # E: list of [3,3] numpy, I: list of indices in ii
+#             E = torch.tensor(np.array(E))
+#             I = torch.tensor(np.array(I))
+#             # check cheirality of the points we used to estimate the models
+#             if E.shape[0] == 0:
+#                 iter += 1
+#                 continue
+#             valid, E, _ = validate_homography_cheirality(E, mx.double(), my.double(), ii[I])
+#             # check ill-conditioning
+#             ill, _ = is_homography_ill_conditioned(E, threshold = 100)
+#             mask = ~ill & valid
+#             EE.extend(E[mask].tolist())
+#             II.extend(I[mask].tolist())
+#             iter += 1
+#         # print(f"Loop for batch {b} took {elapsed_time:.4f} seconds")
+
+#         # get the required number of valid models
+#         if len(EE) > m_batch_size:
+#             EE = EE[:m_batch_size]
+#             II = II[:m_batch_size]
+
+#         if len(EE) < m_batch_size: # this is to prevent errors in decomposition, etc. for the whole batch
+#             num_missing = m_batch_size - len(EE)
+#             EE.extend([torch.eye(3, 3, dtype=torch.float32)] * num_missing)
+#             II.extend([0] * num_missing)
+
+#         if False and b==0: # DEBUG TEST
+#             print('Indices of first model:', II[0])
+#             x1 = mx[ii[II[0]]].cpu()
+#             y1 = my[ii[II[0]]].cpu()
+#             M = torch.tensor(EE[0], dtype = x1.dtype)
+#             reprojected_y1 = (M @ x1.T).T
+#             reprojected_y1 = reprojected_y1 / reprojected_y1[:,2:3]
+#             err = (reprojected_y1 - y1).norm(dim=1)
+#             print('Reprojection errors of first model (px):', err)
+#             r = SampsonBM(x1[None,:, :], y1[None,:, :], M[None, None, :, :])[0,0]
+#             print('Sampson errors of first model in normalized coordinates:', r)
+#             K1 = data['K1'][b].cpu()
+#             K2 = data['K2'][b].cpu()
+#             x1 = unnormalize_points(x1, K1)
+#             y1 = unnormalize_points(y1, K2)
+#             M = unnormalize_models(M[None,:,:], K1, K2)[0]
+#             reprojected_y1 = (M @ x1.T).T
+#             reprojected_y1 = reprojected_y1 / reprojected_y1[:,2:3]
+#             err_px = (reprojected_y1 - y1).norm(dim=1)
+#             print('Reprojection errors of first model (px):', err_px)
+#             r = SampsonBM(x1[None,:, :], y1[None,:, :], M[None, None, :, :])[0,0]
+#             print('Sampson errors of first model in pixel coordinates:', r)
+        
+#         n_models = len(EE)
+#         max_models = max(max_models, n_models)
+#         models[b] = EE
+#     # assert(max_models > 1000)
+#     if max_average_sol is not None:
+#         max_models = min(max_models, m_batch_size*max_average_sol)
+#     for b in range(C.shape[0]):
+#         if len(models[b]) > max_models:
+#             models[b] = models[b][:max_models]
+#         else:
+#             models[b] = np.concatenate([np.stack(models[b]), np.zeros((max_models - len(models[b]), 3, 3))]) # pad models with zeros -- Ok for E but maybe not for H?
+#     models = np.stack(models) # stack along batch dim
+#     models = torch.tensor(models).to(dtype= torch.float32).cpu()
+#     #
+#     # data['models'][:,:1000] = models # use 1K models
+#     if include_GT:
+#         GTmodels = data['models'][:,-1:].to(models)
+#         models = torch.cat([models, GTmodels], dim = 1)
+#     data['models'] = models
 
 
 def normalize_models(models, K1, K2):
@@ -264,24 +376,6 @@ def unnormalize_models(models, K1, K2):
     K1I = K1.inverse()
     M_px = torch.einsum('...ij, ...mjk, ...kl -> ...mil', K2, models, K1I)  # K2 F K1^{-1}
     return M_px
-
-def normalize_points(x, K1):
-    """
-    x [... N 3]
-    y [... N 3]
-    K1 [... 3 3]
-    """
-    K1I = K1.inverse()
-    x = torch.einsum('...ij, ...nj -> ...ni', K1I, x)
-    return x
-
-def unnormalize_points(x, K):
-    """
-    x [... N 3]
-    K [... 3 3]
-    """
-    x = torch.einsum('...ij, ...nj -> ...ni', K, x)
-    return x
 
 def unnormalize(data):
     correspondences = data['correspondences']
@@ -307,15 +401,16 @@ def compute_residuals(data):
     with torch.no_grad():
         x, y, M = unnormalize(data)
         r = SampsonBM(x, y, M)
+        # r = SymmetricReprojectionError(x, y, M) # DEBUG
         r = torch.nan_to_num(r, nan=float('inf'))
         residuals = r.abs()
         data['residuals'] = residuals
 
 
 
-def new_minimal_models_H(data, m_batch_size, max_average_sol=None, include_GT=False):
-    return new_minimal_models(data, m_batch_size, max_average_sol=max_average_sol, include_GT=include_GT, solver = solve_homography, min_sample=4)
-
+def new_minimal_models(data, m_batch_size, max_average_sol=None, include_GT=False):
+    return model.new_minimal_models(data, m_batch_size, max_average_sol=max_average_sol, include_GT=include_GT, solver = model.solve_homography, min_sample=4, validation_fn=validate_homography)
+    
 # def normalized_homography(H, K1, K2):
 #     normalizedHomography = np.linalg.inv(K2).dot(H1to2).dot(K1)
 
@@ -338,34 +433,23 @@ def pose_error_batch_torch(models, data, method = 'torch'):
 
     B, M = models.shape[:2]
     Err_R = torch.zeros((B, M), dtype=models.dtype, device=models.device)
+    Err_t = torch.zeros((B, M), dtype=models.dtype, device=models.device)
+    Err_e = torch.zeros((B, M), dtype=models.dtype, device=models.device)
     # Decompose using torch
     if method == 'torch':
-        BRs, Bts, Bnormals, _ = decompose_homography_robust(models, s3_threshold = 0.01) # [B, M, num, 3, 3], [B, M, num, 3], [B, M, num, 3]
+        BRs, Bts, Bnormals = decompose_homography_mat(models) # [B, M, num, 3, 3], [B, M, num, 3], [B, M, num, 3]
         num = 4
         for b in range(B):
             err_R_sm = torch.zeros((num,M), dtype=models.dtype, device=models.device)
+            err_t_sm = torch.zeros((num,M), dtype=models.dtype, device=models.device)
             for s in range(num):
                 err_R_sm[s] = R_error(to_tensor(BRs[b,:,s]), gt_R[b][None,:,:])
+                err_t_sm[s] = t_error(to_tensor(Bts[b,:,s]), gt_T[b][None,:])
             Err_R[b] = err_R_sm.min(dim=0).values
-            if False and b == 0: # DEBUG
-                Err_R_ref = torch.zeros((M,), dtype=models.dtype, device=models.device)
-                for m in range(100):
-                    num, Rs, ts, normals = cv2.decomposeHomographyMat(models[b,m].cpu().numpy(), np.identity(3))
-                    Rs1, ts1, normals1 = decompose_homography_mat(models[b,m].cpu().double())
-                    err_R = 180.0
-                    err_t = 180.0
-                    for s in range(num):
-                        e_R = R_error(to_tensor(Rs[s]), gt_R[b].cpu().double()).item()
-                        e_t = t_error(to_tensor(ts[s].flatten()), gt_T[b].cpu().double()).item()
-                        err_R = min(err_R, e_R)
-                        err_t = min(err_t, e_t)
-                    Err_R_ref[m] = err_R
-                print('Max difference in Err_R between torch and cv2 for first 100 models:', (Err_R[b,:100] - Err_R_ref[:100]).abs().max().item())
-                print('Mean difference in Err_R between torch and cv2 for first 100 models:', (Err_R[b,:100] - Err_R_ref[:100]).abs().mean().item())
-                print('Std difference in Err_R between torch and cv2 for first 100 models:', (Err_R[b,:100] - Err_R_ref[:100]).abs().std().item())
-
-        # Err_t = R_error(to_tensor(BRs[:,0]), gt_R)
-        return Err_R, Err_R, Err_R # DEBUG
+            Err_t[b] = err_t_sm.min(dim=0).values
+            Err_e[b] = torch.max(Err_R[b], Err_t[b])
+        Err_e = Err_R # DEBUG
+        return Err_e, Err_R, Err_t
 
     elif method == 'cv2':
         # models: [B, M, 3, 3]
@@ -384,8 +468,8 @@ def pose_error_batch_torch(models, data, method = 'torch'):
                     err_R = min(err_R, e_R)
                     err_t = min(err_t, e_t)
 
-                if True: # DEBUG:
-                    Rs1, ts1, normals1, _ = decompose_homography_robust(models[b,m].cpu().double())
+                if False: # DEBUG of decompose_homography_mat (more convenient in this loop):
+                    Rs1, ts1, normals1 = decompose_homography_mat(models[b,m].cpu().double())
                     num = 4
                     err_R1 = 180.0
                     err_t1 = 180.0
@@ -401,8 +485,7 @@ def pose_error_batch_torch(models, data, method = 'torch'):
                         print('homography candidate:', models[b,m].cpu().numpy())
                         print('GT:', gt_R[b].cpu().numpy())
                         f,c = is_homography_ill_conditioned(models[b,m].cpu().double(), threshold = 100)
-                        _, s3 = is_decomposition_numerically_unstable(models[b,m].cpu().double())
-                        print(f'Condition number: {c} s3={s3}')
+                        print(f'Condition number: {c}')
                         print("---")
 
                 err_e = max(err_R, err_t)
@@ -412,22 +495,3 @@ def pose_error_batch_torch(models, data, method = 'torch'):
     Err_e = Err_R # DEBUG
     return Err_e, Err_R, Err_t
 
-
-def auc_(data, threshold):
-    # return cv_utils.AUC(data, thresholds=[threshold])[0]
-    return cv_utils.pose_auc(data, thresholds=[threshold])[0]
-
-def AUC_10(data, axis=-1):
-    threshold = 10
-    r = []
-    if data.ndim == 2:
-        assert (axis == -1)
-        for i in range(data.shape[0]):
-            r += [auc_(data[i], threshold)]
-        r = np.array(r)
-    else:
-        assert (data.ndim == 1)
-        assert (axis == 0 or axis == -1)
-        r = auc_(data, threshold)
-    return r
-    # return cv_utils.AUC(data, thresholds=[10], binsize=50)

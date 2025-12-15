@@ -25,9 +25,8 @@ import numpy as np
 import yaml
 
 from  .tools import *
-from  .score_weights import *
-from  .score_weights import SampsonM
-from .model_H import normalize_points
+# from  .score_weights import *
+from .model import normalize_points
 
 PhotoTourismSPSG = dotdict(
 name = 'PhotoTourismSPSG',
@@ -380,6 +379,7 @@ class ResidualData(data.Dataset):
             self.padd_data(data)
             # data["is_F"] = self.F # fundamental matrix flag
             data["is_F"] = False  # fundamental matrix flag
+            data["snn"] = np.ones_like(data["correspondences"][:, 0])*0.8
             return data
         else:
             return self.__getitem__load(index)
@@ -498,7 +498,9 @@ def load_h5(filename):
     return dict_to_load
 
 class H_dataset(data.Dataset):
-    def __init__(self, dataset_info, scene, padding=False, size=3000, snn_threshold = 0.9) -> None:
+    def __init__(self, dataset_info, scene, padding=False, size=3000, snn_threshold = None) -> None:
+        if snn_threshold is None:
+            snn_threshold = 1.0  # use all correspondences
         self.padding = padding
         self.size = size
         config_path = dataset_info.root + '/dataset_configuration.yaml'
@@ -536,11 +538,16 @@ class H_dataset(data.Dataset):
         # select a subset of image pairs?
         file = self.src + '_compressed.pkl'
 
+        valid = False
         if os.path.exists(file):
-            print('Loaded compressed data')
+            print(f'Loaded compressed data {source_path}')
             self.Data = load_object(file)
             self.files = self.Data.meta.files
-        else:
+            if self.Data.meta.snn_threshold != self.snn_threshold:
+                print('Recompressing due to different SNN threshold')
+            else:
+                valid = True
+        if not valid:
             print('Compressing')
             self.Data = self.compress()
             save_object(file, self.Data)
@@ -584,16 +591,26 @@ class H_dataset(data.Dataset):
         N = self.Data.meta.cmax
         C = data['correspondences']
         C = np.concatenate((C, np.full((max(0, N - C.shape[0]), C.shape[1]), np.float32(np.inf))), axis=0)
+        snn = data['snn']
+        snn = np.concatenate((snn, np.ones((max(0, N - snn.shape[0])))), axis=0)
+        inliers = data['inliers']
+        inliers = np.concatenate((inliers, np.zeros((max(0, N - inliers.shape[0])), dtype=bool)), axis=0)
+        data['snn'] = snn
+        data['inliers'] = inliers
         data['correspondences'] = C
 
     def __getitem__load(self, index):
         p = self.files[index]
         data = self.data
-        corr = data[f'corr_{p}'] # The SIFT unnormalized correspondences [num_pts x 9]: [X1, Y1, X2, Y2, angle1, angle2, scale1, scale2, snn_ratio, is_inlier_gt]
+        corr = data[f'corr_{p}'] # The SIFT unnormalized correspondences [num_pts x 10]: [X1, Y1, X2, Y2, angle1, angle2, scale1, scale2, snn_ratio, is_inlier_gt]       
         snn_ratio = corr[:,-2]
-        mask = snn_ratio < self.snn_threshold
+        inliers = corr[:,-1] > 0.5
+        # print('# inliers:', inliers.sum())
+        mask = snn_ratio <= self.snn_threshold
         C = corr[mask, 0:4].astype(np.float32)
-        pose = data[f'pose_{p}'].astype(np.float64) # The ground truth relative pose coming from the COLMAP reconstruction, 3x4 matrix ?
+        snn_ratio = snn_ratio[mask]
+        inliers = inliers[mask]
+        pose = data[f'pose_{p}'].astype(np.float64) # The ground truth relative pose coming from the COLMAP reconstruction, 3x4 matrix [R|t]
         size1 = data[f"size_{ '_'.join(p.split('_')[0:3]) }"].astype(np.float32) # The size of the source image
         size2 = data[f"size_{ '_'.join(p.split('_')[3:6]) }"].astype(np.float32) # The size of the destination image
         K1 = data[f"K_{ '_'.join(p.split('_')[0:3]) }"].astype(np.float32) # The intrinsic matrix of the source image 3x3, single focal length, principle point at size/2
@@ -601,6 +618,8 @@ class H_dataset(data.Dataset):
         num_pts = C.shape[0]
         r = {
             'correspondences': C,
+            'snn': snn_ratio,
+            'inliers': inliers,
             'K1': K1,
             'K2': K2,
             'size1': size1,
@@ -649,8 +668,8 @@ if __run__:
         test_loader(loader)
     if True:
         dataset_info = HEB
-        # scene = 'Piazza_del_Popolo'
-        scene = 'Alamo'
+        scene = 'Piazza_del_Popolo'
+        # scene = 'Alamo'
         dataset = H_dataset(dataset_info, scene, padding=True)
         loader = torch.utils.data.DataLoader(dataset, batch_size=32, num_workers=0, shuffle=False)
         test_loader(loader)

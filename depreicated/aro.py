@@ -6,7 +6,8 @@ import kornia
 from torch import Tensor
 
 from ..functional import *
-from ..score_weights import compute_residuals, sufficient_statistic
+from ..model_E import compute_residuals
+from ..score_weights import sufficient_statistic
 
 
 try:

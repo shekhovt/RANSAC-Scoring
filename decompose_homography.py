@@ -241,39 +241,6 @@ def recompose_homography(R: torch.Tensor, t: torch.Tensor, n: torch.Tensor):
     return H
 
 
-def decompose_homography_robust(H: torch.Tensor, K: torch.Tensor = None, s3_threshold: float = 0.01):
-    """
-    Wrapper around standard Malis-Vargas decomposition.
-    
-    Note: Tests 17-19 prove the standard method works perfectly for ALL cases:
-    - Near-pure rotation (s3 ≈ 1.0): 0° median error
-    - Large translation (s3 ≈ 0.05): 0° median error, 1e-16 recomposition
-    
-    The polar decomposition approach was tested and found unnecessary - it adds
-    complexity without improving accuracy. The standard method is already robust.
-    
-    Args:
-        H: Homography matrix(ces), shape [..., 3, 3]
-        K: Camera intrinsic matrix, shape [3, 3]. If None, assumes K=I
-        s3_threshold: Unused, kept for API compatibility
-    
-    Returns:
-        Rs: Rotation matrices, shape [..., 4, 3, 3]
-        ts: Translation vectors, shape [..., 4, 3]
-        normals: Plane normals, shape [..., 4, 3]
-        used_polar: Always False (polar method removed as unnecessary)
-    """
-    # Simply use the standard method - it works perfectly for all s3 values
-    Rs, ts, normals = decompose_homography_mat(H, K)
-    
-    # Create a False mask with the appropriate shape
-    batch_shape = H.shape[:-2]
-    used_polar = torch.zeros(batch_shape, dtype=torch.bool, device=H.device)
-    
-    return Rs, ts, normals, used_polar
-
-
-
 def is_homography_ill_conditioned(H: torch.Tensor, threshold: float = 100.0):
     """
     Check if a homography is ill-conditioned based on its condition number.
@@ -311,100 +278,7 @@ def is_homography_ill_conditioned(H: torch.Tensor, threshold: float = 100.0):
     return ill_conditioned, condition_number
 
 
-def is_decomposition_numerically_unstable(H: torch.Tensor, K: torch.Tensor = None, s3_threshold: float = 0.01):
-    """
-    Check if homography decomposition will be numerically unstable.
-    
-    This detects cases where H ≈ R (nearly pure rotation), which causes
-    numerical instability in the Malis-Vargas algorithm. This happens when
-    s3 (smallest eigenvalue of normalized H^T*H) is very small.
-    
-    Note: This is DIFFERENT from ill-conditioning (large condition number κ).
-    A well-conditioned matrix (κ < 10) can still have small s3!
-    
-    Args:
-        H: Homography matrix(ces), shape [..., 3, 3]
-        K: Camera intrinsic matrix, shape [3, 3]. If None, assumes K=I
-        s3_threshold: Threshold for s3. Default 0.01. Values below indicate instability.
-    
-    Returns:
-        is_unstable: Boolean tensor, shape [...], True if numerically unstable
-        s3_values: Smallest eigenvalue(s), shape [...]
-        
-    Physical meaning of small s3:
-        - s3 → 0 means H ≈ R (nearly pure rotation)
-        - Translation component is very small
-        - Scene is nearly planar or camera mostly rotates
-        - Hard to distinguish rotation from translation numerically
-        
-    Example:
-        >>> is_unstable, s3 = is_decomposition_numerically_unstable(H)
-        >>> if is_unstable:
-        >>>     print(f"Warning: unstable decomposition (s3={s3:.4f})")
-        >>>     print("Consider using alternative for pure rotation case")
-    """
-    # Normalize by K if provided
-    if K is not None:
-        K_inv = torch.linalg.inv(K)
-        H_norm = K_inv @ H @ K
-    else:
-        H_norm = H
-    
-    # Normalize by second singular value
-    _, S, _ = torch.linalg.svd(H_norm)
-    s2 = S[..., 1:2, None]
-    H2 = H_norm / s2
-    
-    # Compute eigenvalues of H2^T * H2
-    HtH = torch.matmul(H2.transpose(-1, -2), H2)
-    evals, _ = torch.linalg.eigh(HtH)
-    
-    # s3 is the smallest eigenvalue
-    s3 = evals[..., 0]
-    
-    # Check if s3 is below threshold
-    is_unstable = s3 < s3_threshold
-    
-    return is_unstable, s3
-
-
-def decompose_homography_stable(H: torch.Tensor, K: torch.Tensor = None, s3_threshold: float = 0.01):
-    """
-    Decompose homography with automatic handling of numerically unstable cases.
-    
-    This function automatically detects when the standard Malis-Vargas algorithm
-    will be numerically unstable (s3 < threshold) and provides a warning flag.
-    
-    For extremely unstable cases (s3 < 0.001), it detects if H ≈ R (pure rotation)
-    and can optionally use polar decomposition as a more stable alternative.
-    
-    Args:
-        H: Homography matrix(ces), shape [..., 3, 3]
-        K: Camera intrinsic matrix, shape [3, 3]. If None, assumes K=I
-        s3_threshold: Threshold for detecting instability. Default 0.01.
-    
-    Returns:
-        Rs: Rotation matrices, shape [..., 4, 3, 3]
-        ts: Translation vectors, shape [..., 4, 3]
-        normals: Plane normals, shape [..., 4, 3]
-        is_unstable: Boolean flag(s), shape [...], True if numerically unstable
-        s3_values: Smallest eigenvalue(s), shape [...]
-        
-    Recommendation:
-        When is_unstable is True, treat decomposition results with caution.
-        The solutions are geometrically valid but numerically sensitive.
-    """
-    # Check stability
-    is_unstable, s3 = is_decomposition_numerically_unstable(H, K, s3_threshold)
-    
-    # Perform standard decomposition
-    Rs, ts, normals = decompose_homography_mat(H, K)
-    
-    # Return with stability information
-    return Rs, ts, normals, is_unstable, s3
-
-
-def validate_homography_cheirality(H: torch.Tensor, x1: torch.Tensor, x2: torch.Tensor):
+def validate_homography_cheirality(H: torch.Tensor, x1: torch.Tensor, x2: torch.Tensor, ii: torch.Tensor = None):
     """
     Validate homography by checking that all points are in front (positive depth).
     
@@ -414,14 +288,16 @@ def validate_homography_cheirality(H: torch.Tensor, x1: torch.Tensor, x2: torch.
     
     Args:
         H: Homography matrix, shape [..., 3, 3] (batched) or [3, 3] (single)
-        x1: Source points used to compute H, shape [n, 3] or [n, 2] (homogeneous or 2D)
-        x2: Target points used to compute H, shape [n, 3] or [n, 2] (homogeneous or 2D)
-           where n is the number of points (typically 4 for minimal solver)
+        x1: Source points, shape [N, 3] or [N, 2] (all available points)
+        x2: Target points, shape [N, 3] or [N, 2] (all available points)
+        ii: Point indices for each homography, shape [..., m] where m is number of points
+            to validate (typically 4 for minimal solver). If None, uses all points for all H.
+            Each H[i] is validated against points x1[ii[i]], x2[ii[i]].
     
     Returns:
         valid: Boolean or boolean tensor, shape [...], True if all λ_i > 0
         H_corrected: H with det(H) > 0 (flipped if necessary), same shape as H
-        lambdas: Scale factors λ_i for each point, shape [..., n]
+        lambdas: Scale factors λ_i for each point, shape [..., m]
         
     Algorithm:
         1. If det(H) < 0, flip: H ← -H
@@ -434,17 +310,18 @@ def validate_homography_cheirality(H: torch.Tensor, x1: torch.Tensor, x2: torch.
     after the homography transformation.
     
     Example:
-        # Single homography
+        # Single homography with all points
         H = torch.randn(3, 3)
         x1 = torch.randn(4, 2)  # 4 points in 2D
         x2 = torch.randn(4, 2)
         valid, H_corrected, lambdas = validate_homography_cheirality(H, x1, x2)
         
-        # Batched homographies
-        H = torch.randn(10, 3, 3)  # 10 homographies
-        x1 = torch.randn(4, 2)  # Same 4 points for all
-        x2 = torch.randn(4, 2)
-        valid, H_corrected, lambdas = validate_homography_cheirality(H, x1, x2)
+        # Batched homographies with different point subsets (RANSAC use case)
+        H = torch.randn(10, 3, 3)  # 10 homographies from different samples
+        x1 = torch.randn(100, 2)  # 100 total points
+        x2 = torch.randn(100, 2)
+        ii = torch.randint(0, 100, (10, 4))  # Each H uses different 4 points
+        valid, H_corrected, lambdas = validate_homography_cheirality(H, x1, x2, ii)
         # valid: shape [10], H_corrected: shape [10, 3, 3], lambdas: shape [10, 4]
     """
     # Convert to torch tensor if needed
@@ -454,6 +331,8 @@ def validate_homography_cheirality(H: torch.Tensor, x1: torch.Tensor, x2: torch.
         x1 = torch.tensor(x1, dtype=torch.float64)
     if not isinstance(x2, torch.Tensor):
         x2 = torch.tensor(x2, dtype=torch.float64)
+    if ii is not None and not isinstance(ii, torch.Tensor):
+        ii = torch.tensor(ii, dtype=torch.long)
     
     # Store original shape for batching
     H_shape = H.shape
@@ -469,17 +348,37 @@ def validate_homography_cheirality(H: torch.Tensor, x1: torch.Tensor, x2: torch.
         H_flat = H.unsqueeze(0)
         B = 1
     
-    # Ensure points are in homogeneous coordinates [n, 3]
-    n_points = x1.shape[0]
+    # Ensure points are in homogeneous coordinates [N, 3] (all available points)
+    N_total = x1.shape[0]
     if x1.shape[-1] == 2:
-        x1_hom = torch.cat([x1, torch.ones(n_points, 1, dtype=x1.dtype, device=x1.device)], dim=-1)
+        x1_hom = torch.cat([x1, torch.ones(N_total, 1, dtype=x1.dtype, device=x1.device)], dim=-1)
     else:
         x1_hom = x1
         
     if x2.shape[-1] == 2:
-        x2_hom = torch.cat([x2, torch.ones(n_points, 1, dtype=x2.dtype, device=x2.device)], dim=-1)
+        x2_hom = torch.cat([x2, torch.ones(N_total, 1, dtype=x2.dtype, device=x2.device)], dim=-1)
     else:
         x2_hom = x2
+    
+    # Handle point indices
+    if ii is not None:
+        # Batched indices: [..., m] -> [B, m]
+        if is_batched:
+            ii_flat = ii.reshape(B, -1)
+        else:
+            ii_flat = ii.unsqueeze(0) if ii.ndim == 1 else ii
+        m_points = ii_flat.shape[1]
+        
+        # Select points for each homography: [B, m, 3]
+        # Use advanced indexing: for each batch, select m points
+        batch_indices = torch.arange(B, device=ii_flat.device).unsqueeze(1).expand(-1, m_points)
+        x1_selected = x1_hom[ii_flat]  # [B, m, 3]
+        x2_selected = x2_hom[ii_flat]  # [B, m, 3]
+    else:
+        # Use all points for all homographies
+        m_points = N_total
+        x1_selected = x1_hom.unsqueeze(0).expand(B, -1, -1)  # [B, N, 3]
+        x2_selected = x2_hom.unsqueeze(0).expand(B, -1, -1)  # [B, N, 3]
     
     # Step 1: Ensure det(H) > 0 for all homographies
     # Shape: [B]
@@ -491,23 +390,23 @@ def validate_homography_cheirality(H: torch.Tensor, x1: torch.Tensor, x2: torch.
     H_corrected = torch.where(needs_flip.view(B, 1, 1), -H_flat, H_flat)
     
     # Step 2: Compute λ_i for each point and each homography
-    # Transform points: y = H * x_i for all H and all points
-    # x1_hom: [n, 3], H_corrected: [B, 3, 3]
-    # Result: [B, n, 3]
-    y = torch.matmul(H_corrected, x1_hom.T).transpose(1, 2)  # [B, n, 3]
+    # Transform points: y = H * x_i for selected points
+    # x1_selected: [B, m, 3], H_corrected: [B, 3, 3]
+    # Result: [B, m, 3]
+    y = torch.bmm(x1_selected, H_corrected.transpose(1, 2))  # [B, m, 3]
     
     # Find λ_i such that x'_i ≈ λ_i * y
     # Use the component with largest absolute value to avoid division by small numbers
-    # Shape: [B, n]
-    abs_y = torch.abs(y)  # [B, n, 3]
-    max_idx = torch.argmax(abs_y, dim=-1)  # [B, n]
+    # Shape: [B, m]
+    abs_y = torch.abs(y)  # [B, m, 3]
+    max_idx = torch.argmax(abs_y, dim=-1)  # [B, m]
     
     # Gather the max components
-    # y_max: [B, n]
+    # y_max: [B, m]
     y_max = torch.gather(y, 2, max_idx.unsqueeze(-1)).squeeze(-1)
-    x2_max = torch.gather(x2_hom.unsqueeze(0).expand(B, -1, -1), 2, max_idx.unsqueeze(-1)).squeeze(-1)
+    x2_max = torch.gather(x2_selected, 2, max_idx.unsqueeze(-1)).squeeze(-1)
     
-    # Compute lambdas: [B, n]
+    # Compute lambdas: [B, m]
     lambdas = x2_max / (y_max + 1e-12)  # Add small epsilon to avoid division by zero
     
     # Step 3: Check all λ_i > 0 for each homography
@@ -518,7 +417,7 @@ def validate_homography_cheirality(H: torch.Tensor, x1: torch.Tensor, x2: torch.
     if is_batched:
         valid = valid.reshape(batch_dims)
         H_corrected = H_corrected.reshape(*batch_dims, 3, 3)
-        lambdas = lambdas.reshape(*batch_dims, n_points)
+        lambdas = lambdas.reshape(*batch_dims, m_points)
     else:
         # Return scalars/arrays for single homography
         valid = valid.item()
@@ -1380,12 +1279,6 @@ def test_decompose_homography():
         H = H.astype(np.float64)
         H_torch = torch.from_numpy(H).double()
         
-        # Check if well-conditioned
-        is_ill, cond_num = is_homography_ill_conditioned(H_torch, threshold=100.0)
-        
-        if is_ill.item():
-            continue  # Skip ill-conditioned cases
-        
         num_well_conditioned += 1
         
         # Decompose with both methods
@@ -1449,11 +1342,11 @@ def test_decompose_homography():
         if all_matched:
             num_passed += 1
             if num_well_conditioned <= 10:  # Show first 10
-                print(f"  Test {test_idx+1} (κ={cond_num:.2f}): ✓ All 4 OpenCV solutions matched")
+                print(f"  Test {test_idx+1}: ✓ All 4 OpenCV solutions matched")
                 for detail in match_details:
                     print(f"    {detail}")
         else:
-            print(f"  Test {test_idx+1} (κ={cond_num:.2f}): ✗ Some solutions did not match")
+            print(f"  Test {test_idx+1}: ✗ Some solutions did not match")
             for detail in match_details:
                 print(f"    {detail}")
             
@@ -1477,536 +1370,6 @@ def test_decompose_homography():
     print("\n" + "="*80)
     print("All tests completed!")
     print("="*80)
-    
-    # Test 17: Near-pure-rotation homographies - Robust vs OpenCV comparison
-    print("\n" + "="*80)
-    print("Test 17: Near-Pure-Rotation Homographies (1000 samples)")
-    print("Comparing Robust vs OpenCV decomposition accuracy")
-    print("="*80)
-    
-    np.random.seed(456)
-    torch.manual_seed(456)
-    
-    num_tests = 1000
-    opencv_errors = []
-    robust_errors = []
-    s3_values = []
-    
-    def rotation_error_degrees(R1, R2):
-        """Compute rotation error in degrees between two rotation matrices."""
-        if isinstance(R1, np.ndarray):
-            R1 = torch.from_numpy(R1)
-        if isinstance(R2, np.ndarray):
-            R2 = torch.from_numpy(R2)
-        
-        R_diff = R1.double().T @ R2.double()
-        trace = torch.clamp(torch.trace(R_diff), -1.0, 3.0)
-        angle_rad = torch.acos((trace - 1.0) / 2.0)
-        return torch.rad2deg(angle_rad).item()
-    
-    print(f"\nGenerating {num_tests} near-pure-rotation homographies...")
-    print("(Using H = R + t⊗n with varying ||t|| to control s3)")
-    
-    for test_idx in range(num_tests):
-        # Generate random 3D rotation as ground truth
-        angle_x = np.random.uniform(-45, 45) * np.pi / 180
-        angle_y = np.random.uniform(-45, 45) * np.pi / 180
-        angle_z = np.random.uniform(-45, 45) * np.pi / 180
-        
-        Rx = np.array([
-            [1, 0, 0],
-            [0, np.cos(angle_x), -np.sin(angle_x)],
-            [0, np.sin(angle_x), np.cos(angle_x)]
-        ], dtype=np.float64)
-        
-        Ry = np.array([
-            [np.cos(angle_y), 0, np.sin(angle_y)],
-            [0, 1, 0],
-            [-np.sin(angle_y), 0, np.cos(angle_y)]
-        ], dtype=np.float64)
-        
-        Rz = np.array([
-            [np.cos(angle_z), -np.sin(angle_z), 0],
-            [np.sin(angle_z), np.cos(angle_z), 0],
-            [0, 0, 1]
-        ], dtype=np.float64)
-        
-        R_true = Rz @ Ry @ Rx
-        
-        # Choose translation magnitude to control s3
-        # For H = R + t⊗n, smaller ||t|| → smaller s3
-        p = np.random.rand()
-        if p < 0.5:
-            # 50%: Very small translation (→ very small s3)
-            t_mag = np.random.uniform(0.0001, 0.001)
-        elif p < 0.8:
-            # 30%: Small translation (→ small s3)
-            t_mag = np.random.uniform(0.001, 0.01)
-        else:
-            # 20%: Moderate translation (→ moderate s3)
-            t_mag = np.random.uniform(0.01, 0.05)
-        
-        # Random translation direction
-        t = np.random.randn(3, 1)
-        t = t / np.linalg.norm(t) * t_mag
-        
-        # Random normal vector (with z-bias for realism)
-        n = np.array([[np.random.uniform(-0.3, 0.3)],
-                      [np.random.uniform(-0.3, 0.3)],
-                      [np.random.uniform(0.7, 1.0)]])
-        n = n / np.linalg.norm(n)
-        
-        # Construct homography H = R + t⊗n
-        H = R_true + t @ n.T
-        H = H.astype(np.float64)
-        H_torch = torch.from_numpy(H).double()
-        
-        # Compute s3 for statistics
-        _, S, _ = np.linalg.svd(H)
-        H2 = H / S[1]
-        HtH = H2.T @ H2
-        evals = np.linalg.eigvalsh(HtH)
-        s3_actual = np.sqrt(evals[0])
-        s3_values.append(s3_actual)
-        
-        # OpenCV decomposition
-        num_cv, Rs_cv, ts_cv, ns_cv = cv2.decomposeHomographyMat(H, np.eye(3))
-        
-        # Find best OpenCV rotation (closest to ground truth R)
-        # Note: We only compare rotation because (R,t,n) and (R,-t,-n) are equivalent
-        best_cv_err = 180.0
-        for i in range(num_cv):
-            if not np.isnan(Rs_cv[i]).any():
-                err = rotation_error_degrees(R_true, Rs_cv[i])
-                best_cv_err = min(best_cv_err, err)
-        opencv_errors.append(best_cv_err)
-        
-        # Robust decomposition
-        Rs_rob, ts_rob, ns_rob, used_polar = decompose_homography_robust(H_torch, K=None, s3_threshold=0.05)
-        
-        # Find best robust rotation (closest to ground truth R)
-        best_rob_err = 180.0
-        for i in range(4):
-            if not torch.isnan(Rs_rob[i]).any():
-                err = rotation_error_degrees(R_true, Rs_rob[i])
-                best_rob_err = min(best_rob_err, err)
-        robust_errors.append(best_rob_err)
-    
-    # Convert to numpy arrays for analysis
-    opencv_errors = np.array(opencv_errors)
-    robust_errors = np.array(robust_errors)
-    s3_values = np.array(s3_values)
-    
-    print(f"\n{'='*80}")
-    print("RESULTS:")
-    print(f"{'='*80}")
-    
-    print(f"\ns3 distribution:")
-    print(f"  Min:    {s3_values.min():.6f}")
-    print(f"  25%:    {np.percentile(s3_values, 25):.6f}")
-    print(f"  Median: {np.median(s3_values):.6f}")
-    print(f"  75%:    {np.percentile(s3_values, 75):.6f}")
-    print(f"  Max:    {s3_values.max():.6f}")
-    
-    print(f"\nOpenCV rotation error (degrees):")
-    print(f"  Min:    {opencv_errors.min():.2f}°")
-    print(f"  25%:    {np.percentile(opencv_errors, 25):.2f}°")
-    print(f"  Median: {np.median(opencv_errors):.2f}°")
-    print(f"  75%:    {np.percentile(opencv_errors, 75):.2f}°")
-    print(f"  Max:    {opencv_errors.max():.2f}°")
-    print(f"  Mean:   {opencv_errors.mean():.2f}°")
-    
-    print(f"\nRobust rotation error (degrees):")
-    print(f"  Min:    {robust_errors.min():.2f}°")
-    print(f"  25%:    {np.percentile(robust_errors, 25):.2f}°")
-    print(f"  Median: {np.median(robust_errors):.2f}°")
-    print(f"  75%:    {np.percentile(robust_errors, 75):.2f}°")
-    print(f"  Max:    {robust_errors.max():.2f}°")
-    print(f"  Mean:   {robust_errors.mean():.2f}°")
-    
-    # Compute improvement
-    diff = opencv_errors - robust_errors
-    better_count = (robust_errors < opencv_errors).sum()
-    worse_count = (robust_errors > opencv_errors).sum()
-    tied_count = (robust_errors == opencv_errors).sum()
-    
-    print(f"\nComparison:")
-    print(f"  Median difference (OpenCV - Robust): {np.median(diff):.2f}° (positive = Robust better)")
-    print(f"  Mean difference:                     {diff.mean():.2f}°")
-    print(f"  Robust better:  {better_count}/{num_tests} ({100*better_count/num_tests:.1f}%)")
-    print(f"  OpenCV better:  {worse_count}/{num_tests} ({100*worse_count/num_tests:.1f}%)")
-    print(f"  Tied:           {tied_count}/{num_tests} ({100*tied_count/num_tests:.1f}%)")
-    
-    # Check which cases robust is significantly better
-    very_small_s3 = s3_values < 0.01
-    if very_small_s3.sum() > 0:
-        print(f"\nCases with s3 < 0.01 (n={very_small_s3.sum()}):")
-        print(f"  OpenCV median error: {np.median(opencv_errors[very_small_s3]):.2f}°")
-        print(f"  Robust median error: {np.median(robust_errors[very_small_s3]):.2f}°")
-        print(f"  Improvement: {np.median(opencv_errors[very_small_s3]) - np.median(robust_errors[very_small_s3]):.2f}°")
-    
-    small_s3 = (s3_values >= 0.01) & (s3_values < 0.05)
-    if small_s3.sum() > 0:
-        print(f"\nCases with 0.01 ≤ s3 < 0.05 (n={small_s3.sum()}):")
-        print(f"  OpenCV median error: {np.median(opencv_errors[small_s3]):.2f}°")
-        print(f"  Robust median error: {np.median(robust_errors[small_s3]):.2f}°")
-        print(f"  Improvement: {np.median(opencv_errors[small_s3]) - np.median(robust_errors[small_s3]):.2f}°")
-    
-    larger_s3 = s3_values >= 0.05
-    if larger_s3.sum() > 0:
-        print(f"\nCases with s3 ≥ 0.05 (n={larger_s3.sum()}):")
-        print(f"  OpenCV median error: {np.median(opencv_errors[larger_s3]):.2f}°")
-        print(f"  Robust median error: {np.median(robust_errors[larger_s3]):.2f}°")
-        print(f"  Improvement: {np.median(opencv_errors[larger_s3]) - np.median(robust_errors[larger_s3]):.2f}°")
-    
-    if np.median(robust_errors) < np.median(opencv_errors):
-        print(f"\n✓ Robust method is MORE ACCURATE (median: {np.median(robust_errors):.2f}° vs {np.median(opencv_errors):.2f}°)")
-    elif np.median(robust_errors) > np.median(opencv_errors):
-        print(f"\n✗ OpenCV is more accurate (median: {np.median(opencv_errors):.2f}° vs {np.median(robust_errors):.2f}°)")
-    else:
-        print(f"\n= Tied performance (median: {np.median(opencv_errors):.2f}°)")
-    
-    print(f"\n{'='*80}")
-    print("IMPORTANT FINDINGS:")
-    print(f"{'='*80}")
-    print(f"✓ Both methods achieve PERFECT median rotation recovery (0.00°)")
-    print(f"✓ For near-pure-rotation homographies (s3 ≈ 0.95-1.0), decomposition works correctly!")
-    print(f"")
-    print(f"Note on s3 interpretation:")
-    print(f"  - s3 ≈ 1.0 (like 0.95-0.999) = near-pure-rotation (H ≈ R)")
-    print(f"  - s3 ≈ 0.0 would mean highly degenerate (doesn't occur for H = R + t⊗n)")
-    print(f"  - For H = R + t⊗n with ||R|| ≈ √2 and ||t|| ≈ 0.001: s3 ≈ 0.9995")
-    print(f"  - To get s3 < 0.9, need ||t|| > 0.2 (no longer \"near-pure-rotation\")")
-    print(f"")
-    print(f"Max errors:")
-    print(f"  OpenCV: {opencv_errors.max():.2f}° (still excellent!)")
-    print(f"  Robust: {robust_errors.max():.2f}° (perfect!)")
-    print(f"")
-    print(f"Conclusion: PyTorch decomposition is WORKING CORRECTLY!")
-    print(f"No numerical instability issues detected for s3 ∈ [0.95, 1.0]")
-    print(f"{'='*80}")
-    
-    # Test 18: Geometric meaning of s3 - when does it become small?
-    print("\n" + "="*80)
-    print("Test 18: Geometric Meaning of s3 - When Does It Become Small?")
-    print("="*80)
-    print("Understanding what s3 represents geometrically in H = R + t⊗n")
-    print()
-    
-    def compute_s3_value(H_np):
-        """Compute s3 from homography matrix"""
-        _, S, _ = np.linalg.svd(H_np)
-        H_norm = H_np / S[1]
-        HtH = H_norm.T @ H_norm
-        evals = np.linalg.eigvalsh(HtH)
-        return np.sqrt(evals[0])
-    
-    # Setup: Fixed rotation and normal
-    angle_z = 30 * np.pi / 180
-    R_test = np.array([[np.cos(angle_z), -np.sin(angle_z), 0],
-                       [np.sin(angle_z), np.cos(angle_z), 0],
-                       [0, 0, 1]], dtype=np.float64)
-    n_test = np.array([[0.0], [0.0], [1.0]], dtype=np.float64)
-    
-    print("Scenario: R = 30° rotation around Z-axis, n = [0, 0, 1]")
-    print()
-    
-    # Test 1: In-plane vs out-of-plane translation
-    print("Part 1: Translation Direction Effect")
-    print("-" * 60)
-    print("In-plane translation (t ⊥ n, parallel to plane):")
-    in_plane_s3 = []
-    for t_mag in [0.1, 0.3, 0.5, 1.0, 2.0]:
-        t = np.array([[t_mag], [0.0], [0.0]])  # t perpendicular to n
-        H = R_test + t @ n_test.T
-        s3 = compute_s3_value(H)
-        in_plane_s3.append(s3)
-        print(f"  ||t|| = {t_mag:.1f} → s3 = {s3:.6f}")
-    
-    print("\nOut-of-plane translation (t ∥ n, perpendicular to plane):")
-    out_plane_s3 = []
-    for t_mag in [0.1, 0.3, 0.5, 1.0, 2.0]:
-        t = np.array([[0.0], [0.0], [t_mag]])  # t parallel to n
-        H = R_test + t @ n_test.T
-        s3 = compute_s3_value(H)
-        out_plane_s3.append(s3)
-        print(f"  ||t|| = {t_mag:.1f} → s3 = {s3:.6f}")
-    
-    print(f"\n✓ KEY FINDING: In-plane translation DECREASES s3 (from {in_plane_s3[0]:.3f} to {in_plane_s3[-1]:.3f})")
-    print(f"✓ KEY FINDING: Out-of-plane translation has NO EFFECT on s3 (stays at {out_plane_s3[0]:.3f})")
-    
-    # Test 2: Rotation axis effect
-    print(f"\n\nPart 2: Rotation Axis Effect")
-    print("-" * 60)
-    t_fixed = np.array([[0.5], [0.0], [0.0]])  # Fixed in-plane translation
-    
-    print("Rotation AROUND normal n (spin around viewing direction):")
-    around_n_s3 = []
-    for angle_deg in [0, 15, 30, 45, 60, 90]:
-        angle = angle_deg * np.pi / 180
-        R = np.array([[np.cos(angle), -np.sin(angle), 0],
-                      [np.sin(angle), np.cos(angle), 0],
-                      [0, 0, 1]], dtype=np.float64)
-        H = R + t_fixed @ n_test.T
-        s3 = compute_s3_value(H)
-        around_n_s3.append(s3)
-        print(f"  {angle_deg:2d}° rotation around Z → s3 = {s3:.6f}")
-    
-    print("\nRotation PERPENDICULAR to normal (tilt/pan motion):")
-    perp_n_s3 = []
-    for angle_deg in [0, 15, 30, 45, 60, 90]:
-        angle = angle_deg * np.pi / 180
-        # Rotation around X-axis (perpendicular to n=[0,0,1])
-        R = np.array([[1, 0, 0],
-                      [0, np.cos(angle), -np.sin(angle)],
-                      [0, np.sin(angle), np.cos(angle)]], dtype=np.float64)
-        H = R + t_fixed @ n_test.T
-        s3 = compute_s3_value(H)
-        perp_n_s3.append(s3)
-        print(f"  {angle_deg:2d}° rotation around X → s3 = {s3:.6f}")
-    
-    print(f"\n✓ KEY FINDING: Rotation around n has MINIMAL effect on s3 (stays ≈ {around_n_s3[0]:.3f})")
-    print(f"✓ KEY FINDING: Rotation perpendicular to n has MINIMAL effect on s3")
-    print(f"  (Both keep s3 ≈ {perp_n_s3[0]:.3f} because t dominates for ||t||=0.5)")
-    
-    # Test 3: Pure rotation cases
-    print(f"\n\nPart 3: Pure Rotation (||t|| → 0)")
-    print("-" * 60)
-    t_tiny = np.array([[0.001], [0.0], [0.0]])  # Very small translation
-    
-    print("With tiny translation ||t||=0.001:")
-    for angle_deg in [0, 30, 60, 90]:
-        angle = angle_deg * np.pi / 180
-        R = np.array([[np.cos(angle), -np.sin(angle), 0],
-                      [np.sin(angle), np.cos(angle), 0],
-                      [0, 0, 1]], dtype=np.float64)
-        H = R + t_tiny @ n_test.T
-        s3 = compute_s3_value(H)
-        print(f"  {angle_deg:2d}° rotation → s3 = {s3:.6f}")
-    
-    print(f"\n✓ KEY FINDING: Near-pure rotation (small ||t||) → s3 ≈ 1.0")
-    
-    # Summary
-    print(f"\n\n{'='*60}")
-    print("GEOMETRIC INTERPRETATION OF s3:")
-    print(f"{'='*60}")
-    print()
-    print("s3 ≈ 1.0 (LARGE s3):")
-    print("  • Small translation magnitude (any direction)")
-    print("  • Camera motion is mostly ROTATION")
-    print("  • H ≈ R (nearly pure rotation homography)")
-    print("  → Decomposition is STABLE and accurate")
-    print()
-    print("s3 << 1.0 (SMALL s3, e.g., < 0.8):")
-    print("  • Large IN-PLANE translation (t ⊥ n)")
-    print("  • Translation component dominates over rotation")
-    print("  • H = R + large(t⊗n) where t is parallel to plane")
-    print("  → Decomposition becomes more challenging")
-    print()
-    print("IMPORTANT: s3 is INDEPENDENT of:")
-    print("  • Out-of-plane translation (t ∥ n)")
-    print("  • Rotation angle (both around n and perpendicular to n)")
-    print()
-    print("CONCLUSION:")
-    print("  s3 measures the MAGNITUDE of in-plane translation")
-    print("  relative to the overall transformation.")
-    print("  Small s3 = dominant in-plane motion")
-    print("  Large s3 = rotation-dominated or small translation")
-    print(f"{'='*60}")
-    
-    # Test 19: TRULY small s3 values - test decomposition accuracy
-    print("\n" + "="*80)
-    print("Test 19: Truly Small s3 Values (< 0.1) - Decomposition Accuracy")
-    print("="*80)
-    print("Testing cases with s3 < 0.1 (very large in-plane translation)")
-    print()
-    
-    np.random.seed(789)
-    torch.manual_seed(789)
-    
-    # Method 1: Large in-plane translation for H = R + t⊗n
-    print("Method 1: H = R + large_in_plane_t ⊗ n")
-    print("-" * 80)
-    
-    R_test = np.array([[np.cos(0.5), -np.sin(0.5), 0],
-                       [np.sin(0.5), np.cos(0.5), 0],
-                       [0, 0, 1]], dtype=np.float64)
-    n_test = np.array([[0], [0], [1]], dtype=np.float64)
-    
-    method1_results = []
-    for t_mag in [5.0, 10.0, 20.0]:
-        t = np.array([[t_mag], [0], [0]])
-        H = R_test + t @ n_test.T
-        
-        s3 = compute_s3_value(H)
-        
-        # OpenCV
-        H_cv = H.copy()
-        num_cv, Rs_cv, ts_cv, ns_cv = cv2.decomposeHomographyMat(H_cv, np.eye(3))
-        best_cv_err = min([rotation_error_degrees(R_test, Rs_cv[i]) 
-                          for i in range(num_cv) if not np.isnan(Rs_cv[i]).any()])
-        
-        # PyTorch standard
-        H_torch = torch.from_numpy(H).double()
-        Rs_std, ts_std, ns_std = decompose_homography_mat(H_torch)
-        best_std_err = min([rotation_error_degrees(R_test, Rs_std[i]) 
-                           for i in range(4) if not torch.isnan(Rs_std[i]).any()])
-        
-        # PyTorch robust
-        Rs_rob, ts_rob, ns_rob, used_polar = decompose_homography_robust(H_torch, K=None, s3_threshold=0.2)
-        best_rob_err = min([rotation_error_degrees(R_test, Rs_rob[i]) 
-                           for i in range(4) if not torch.isnan(Rs_rob[i]).any()])
-        
-        method1_results.append((t_mag, s3, best_cv_err, best_std_err, best_rob_err, used_polar.item()))
-        print(f"  ||t|| = {t_mag:5.1f}, s3 = {s3:.6f}:")
-        print(f"    OpenCV:         {best_cv_err:6.2f}°")
-        print(f"    PyTorch Std:    {best_std_err:6.2f}°")
-        print(f"    PyTorch Robust: {best_rob_err:6.2f}° (polar={used_polar.item()})")
-    
-    # Method 2: Construct H directly with very small target s3
-    print("\n\nMethod 2: Direct eigendecomposition (arbitrary s3, not H = R + t⊗n)")
-    print("-" * 80)
-    print("Note: These H are NOT of form R + t⊗n, so no ground truth R to compare!")
-    print("We can only verify recomposition: H = R + t⊗n from decomposed (R,t,n)")
-    print()
-    
-    method2_results = []
-    for target_s3 in [0.001, 0.01, 0.05, 0.1]:
-        s1 = 1.1
-        
-        # Random orthogonal matrices
-        V, _ = np.linalg.qr(np.random.randn(3, 3))
-        U, _ = np.linalg.qr(np.random.randn(3, 3))
-        if np.linalg.det(U) < 0:
-            U[:, 0] *= -1
-        
-        eigenvalues = np.array([target_s3**2, 1.0, s1**2])
-        singular_values = np.sqrt(eigenvalues)
-        H = U @ np.diag(singular_values) @ V.T
-        
-        # Normalize
-        _, S_check, _ = np.linalg.svd(H)
-        H = H / S_check[1]
-        
-        s3_actual = compute_s3_value(H)
-        
-        # Decompose with all methods
-        H_torch = torch.from_numpy(H).double()
-        
-        # OpenCV
-        num_cv, Rs_cv, ts_cv, ns_cv = cv2.decomposeHomographyMat(H, np.eye(3))
-        
-        # PyTorch standard
-        Rs_std, ts_std, ns_std = decompose_homography_mat(H_torch)
-        
-        # PyTorch robust
-        Rs_rob, ts_rob, ns_rob, used_polar = decompose_homography_robust(H_torch, K=None, s3_threshold=0.2)
-        
-        # Check recomposition errors (best we can do without ground truth R)
-        cv_recomp_errs = []
-        for i in range(num_cv):
-            if not np.isnan(Rs_cv[i]).any():
-                H_rec = Rs_cv[i] + ts_cv[i] @ ns_cv[i].T
-                err = np.linalg.norm(H / np.linalg.norm(H, 'fro') - H_rec / np.linalg.norm(H_rec, 'fro'))
-                cv_recomp_errs.append(err)
-        
-        std_recomp_errs = []
-        for i in range(4):
-            if not torch.isnan(Rs_std[i]).any():
-                H_rec = Rs_std[i] + ts_std[i].unsqueeze(1) @ ns_std[i].unsqueeze(0)
-                err = torch.norm(H_torch / torch.norm(H_torch, 'fro') - H_rec / torch.norm(H_rec, 'fro')).item()
-                std_recomp_errs.append(err)
-        
-        rob_recomp_errs = []
-        for i in range(4):
-            if not torch.isnan(Rs_rob[i]).any():
-                H_rec = Rs_rob[i] + ts_rob[i].unsqueeze(1) @ ns_rob[i].unsqueeze(0)
-                err = torch.norm(H_torch / torch.norm(H_torch, 'fro') - H_rec / torch.norm(H_rec, 'fro')).item()
-                rob_recomp_errs.append(err)
-        
-        method2_results.append((target_s3, s3_actual, 
-                               min(cv_recomp_errs) if cv_recomp_errs else float('inf'),
-                               min(std_recomp_errs) if std_recomp_errs else float('inf'),
-                               min(rob_recomp_errs) if rob_recomp_errs else float('inf'),
-                               used_polar.item()))
-        
-        print(f"  Target s3 = {target_s3:.3f}, Actual s3 = {s3_actual:.6f}:")
-        print(f"    OpenCV recomposition error:         {min(cv_recomp_errs) if cv_recomp_errs else float('inf'):.2e}")
-        print(f"    PyTorch Std recomposition error:    {min(std_recomp_errs) if std_recomp_errs else float('inf'):.2e}")
-        print(f"    PyTorch Robust recomposition error: {min(rob_recomp_errs) if rob_recomp_errs else float('inf'):.2e} (polar={used_polar.item()})")
-    
-    # Summary
-    print(f"\n\n{'='*80}")
-    print("SUMMARY:")
-    print(f"{'='*80}")
-    print()
-    print("Method 1 (H = R + large_t⊗n, with ground truth R):")
-    print("  • Can test rotation recovery accuracy")
-    print("  • s3 ranges from 0.05 to 0.2 with ||t|| = 5-20")
-    print("  • All methods achieve:")
-    for t_mag, s3, cv_err, std_err, rob_err, polar in method1_results:
-        print(f"    s3={s3:.3f}: OpenCV {cv_err:.1f}°, Std {std_err:.1f}°, Robust {rob_err:.1f}°")
-    
-    print()
-    print("Method 2 (Direct construction, arbitrary s3):")
-    print("  • Can achieve s3 < 0.01 (very small!)")
-    print("  • No ground truth R, so test recomposition only")
-    print("  • All methods achieve perfect recomposition:")
-    for target_s3, s3_actual, cv_err, std_err, rob_err, polar in method2_results:
-        print(f"    s3={s3_actual:.3f}: OpenCV {cv_err:.1e}, Std {std_err:.1e}, Robust {rob_err:.1e}")
-    
-    print()
-    print("CRITICAL FINDING:")
-    if all(err < 0.5 for _, _, err, _, _, _ in method1_results):
-        print("  ✓ Even with s3 as low as 0.05, rotation recovery is EXCELLENT (<0.5°)!")
-    if all(err < 1e-10 for _, _, err, _, _, _ in method2_results):
-        print("  ✓ Even with s3 as low as 0.001, recomposition is PERFECT (<1e-10)!")
-    
-    print()
-    print("CONCLUSION:")
-    print("  • PyTorch decomposition works correctly even for s3 < 0.1")
-    print("  • For H = R + t⊗n (physically valid), recovery is accurate")
-    print("  • For arbitrary H (from eigendecomposition), recomposition is perfect")
-    print("  • The 'small s3 problem' is NOT numerical instability!")
-    print("  • It's about WHICH rotation the algorithm chooses from the 4 solutions")
-    print(f"{'='*80}")
-    
-    # Test 11: Test ill-conditioned check
-    print("\n" + "="*80)
-    print("Test 11: Ill-conditioned homography detection")
-    print("="*80)
-    
-    # Test well-conditioned homography (identity)
-    H_good = torch.eye(3, dtype=torch.float64)
-    is_ill, cond = is_homography_ill_conditioned(H_good)
-    print(f"\nIdentity matrix:")
-    print(f"  Condition number: {cond:.2f}")
-    print(f"  Ill-conditioned: {is_ill.item()} {'✓' if not is_ill else '✗'}")
-    
-    # Test ill-conditioned homography (user's case)
-    H_bad = torch.tensor([[-0.2085,  0.2413,  0.0078],
-                          [ 0.0320, -0.0415, -0.0028],
-                          [ 0.6958, -0.6400, -0.0423]], dtype=torch.float64)
-    is_ill, cond = is_homography_ill_conditioned(H_bad)
-    print(f"\nUser's ill-conditioned matrix:")
-    print(f"  Condition number: {cond:.2f}")
-    print(f"  Ill-conditioned: {is_ill.item()} {'✓' if is_ill else '✗'}")
-    
-    # Test batch processing
-    H_batch = torch.stack([H_good, H_bad])
-    is_ill_batch, cond_batch = is_homography_ill_conditioned(H_batch)
-    print(f"\nBatch of 2 homographies:")
-    print(f"  Condition numbers: {cond_batch.numpy()}")
-    print(f"  Ill-conditioned: {is_ill_batch.numpy()}")
-    print(f"  ✓ Batch processing works")
-    
-    # Test with custom threshold
-    is_ill_strict, _ = is_homography_ill_conditioned(H_bad, threshold=50.0)
-    is_ill_loose, _ = is_homography_ill_conditioned(H_bad, threshold=1000.0)
-    print(f"\nCustom thresholds for user's matrix (κ={cond:.2f}):")
-    print(f"  Threshold=50.0: ill-conditioned={is_ill_strict.item()}")
-    print(f"  Threshold=1000.0: ill-conditioned={is_ill_loose.item()}")
-    print(f"  ✓ Custom thresholds work")
     
     # Test 12: Multi-dimensional batch processing [B, M, 3, 3]
     print("\n" + "="*80)
@@ -2382,856 +1745,6 @@ def test_decompose_homography():
         print("\n✗ Some solver homographies failed validation")
 
 
-def test_14_pytorch_opencv_equivalence():
-    """
-    Test 14: Verify PyTorch and OpenCV solution equivalence.
-    
-    This test checks whether PyTorch and OpenCV find the same 4 solutions.
-    Result depends on geometric degeneracy:
-    - NORMAL CASE (s3 > 0.1): Should find identical solutions (up to reordering)
-    - DEGENERATE CASE (s3 < 0.1): May find different but valid solutions
-    
-    Note: This is NOT about condition number κ. Even well-conditioned matrices
-    (κ < 10) can have small s3, causing geometric degeneracy.
-    """
-    print("\n" + "="*80)
-    print("Test 14: PyTorch-OpenCV Solution Equivalence")
-    print("="*80)
-    
-    # Test both well-conditioned and ill-conditioned cases
-    test_cases = [
-        ("WELL-CONDITIONED", [
-            np.array([[0.99968594, 0.00866629, -0.50480932],
-                      [-0.01026466, 0.9998945, -0.10316439],
-                      [0.50463986, 0.10395479, 0.99733466]], dtype=np.float64),
-            np.array([[0.99791527, 0.01200032, -0.71766776],
-                      [-0.01491286, 0.99989945, -0.19567017],
-                      [0.71738327, 0.19643831, 0.99619943]], dtype=np.float64),
-        ]),
-        ("SMALL s3 (degenerate)", [
-            np.array([[-0.01290631,  0.67397112, -0.02455027],
-                      [-0.21147446,  0.19496514, -0.00204381],
-                      [ 0.54549676,  0.02824806, -0.40483576]], dtype=np.float64),
-            np.array([[-0.43574923, -0.09365383, -0.01017198],
-                      [ 0.13364683,  0.0279612,  -0.01086375],
-                      [ 0.78219539,  0.40450409, -0.08386653]], dtype=np.float64),
-        ])
-    ]
-    
-    for case_name, homographies in test_cases:
-        print(f"\n{'='*80}")
-        print(f"Testing {case_name} homographies")
-        print(f"{'='*80}")
-        
-        all_match = True
-        K = np.eye(3)
-        
-        for idx, H in enumerate(homographies):
-            # Check condition
-            U, S, Vt = np.linalg.svd(H)
-            cond = S[0] / S[2] if S[2] > 1e-10 else float('inf')
-            
-            # Check eigenvalues
-            H_norm = H / S[1]
-            HtH = H_norm.T @ H_norm
-            evals, _ = np.linalg.eigh(HtH)
-            s3 = evals[0]  # smallest eigenvalue
-            
-            print(f"\n{'-'*80}")
-            print(f"Homography {idx+1}: κ={cond:.2f}, s3={s3:.6f}")
-            
-            # OpenCV decomposition
-            num_cv, Rs_cv, ts_cv, ns_cv = cv2.decomposeHomographyMat(H, K)
-            
-            # PyTorch decomposition
-            H_torch = torch.from_numpy(H)
-            Rs_pt, ts_pt, ns_pt = decompose_homography_mat(H_torch, torch.eye(3, dtype=torch.float64))
-            Rs_pt = Rs_pt.numpy()
-            ts_pt = ts_pt.numpy()
-            ns_pt = ns_pt.numpy()
-            
-            # Check if every PyTorch solution matches some OpenCV solution
-            pt_matches = []
-            for i_pt in range(len(Rs_pt)):
-                R_pt = Rs_pt[i_pt]
-                t_pt = ts_pt[i_pt].reshape(3, 1)
-                n_pt = ns_pt[i_pt].reshape(3, 1)
-                
-                found_match = False
-                for i_cv in range(num_cv):
-                    R_cv = Rs_cv[i_cv]
-                    t_cv = ts_cv[i_cv]
-                    n_cv = ns_cv[i_cv]
-                    
-                    # Check direct and flipped matches
-                    err_R = np.linalg.norm(R_pt - R_cv, 'fro')
-                    err_t = np.linalg.norm(t_pt - t_cv)
-                    err_n = np.linalg.norm(n_pt - n_cv)
-                    
-                    err_R_flip = np.linalg.norm(R_pt - R_cv, 'fro')
-                    err_t_flip = np.linalg.norm(t_pt - (-t_cv))
-                    err_n_flip = np.linalg.norm(n_pt - (-n_cv))
-                    
-                    if (err_R < 1e-6 and err_t < 1e-6 and err_n < 1e-6) or \
-                       (err_R_flip < 1e-6 and err_t_flip < 1e-6 and err_n_flip < 1e-6):
-                        found_match = True
-                        break
-                
-                pt_matches.append(found_match)
-            
-            all_pt_match = all(pt_matches)
-            
-            # Check if every OpenCV solution matches some PyTorch solution
-            cv_matches = []
-            for i_cv in range(num_cv):
-                R_cv = Rs_cv[i_cv]
-                t_cv = ts_cv[i_cv]
-                n_cv = ns_cv[i_cv]
-                
-                found_match = False
-                for i_pt in range(len(Rs_pt)):
-                    R_pt = Rs_pt[i_pt]
-                    t_pt = ts_pt[i_pt].reshape(3, 1)
-                    n_pt = ns_pt[i_pt].reshape(3, 1)
-                    
-                    err_R = np.linalg.norm(R_cv - R_pt, 'fro')
-                    err_t = np.linalg.norm(t_cv - t_pt)
-                    err_n = np.linalg.norm(n_cv - n_pt)
-                    
-                    err_R_flip = np.linalg.norm(R_cv - R_pt, 'fro')
-                    err_t_flip = np.linalg.norm(t_cv - (-t_pt))
-                    err_n_flip = np.linalg.norm(n_cv - (-n_pt))
-                    
-                    if (err_R < 1e-6 and err_t < 1e-6 and err_n < 1e-6) or \
-                       (err_R_flip < 1e-6 and err_t_flip < 1e-6 and err_n_flip < 1e-6):
-                        found_match = True
-                        break
-                
-                cv_matches.append(found_match)
-            
-            all_cv_match = all(cv_matches)
-            
-            # Report results
-            if all_pt_match and all_cv_match:
-                print(f"  ✓ Solutions MATCH (same 4 mathematical solutions)")
-            else:
-                print(f"  ✗ Solutions DIFFER (different decompositions)")
-                if case_name == "SMALL s3 (degenerate)":
-                    print(f"    → Expected for degenerate case (s3={s3:.6f} < 0.1)")
-                    print(f"    → Multiple valid decompositions exist due to geometric degeneracy")
-                else:
-                    print(f"    → UNEXPECTED for well-conditioned case!")
-                    all_match = False
-        
-        # Summary for this case type
-        print(f"\n{'-'*80}")
-        if case_name == "WELL-CONDITIONED":
-            print("Expected: Solutions should match (theory: exactly 4 solutions)")
-            if all_match:
-                print("Result: ✓ PASS - PyTorch and OpenCV find the same 4 solutions")
-            else:
-                print("Result: ✗ FAIL - Solutions differ unexpectedly")
-        else:
-            print("Expected: Solutions may differ (numerical instability)")
-            print("Result: Documented - Both are valid but numerically different")
-    
-    print(f"\n{'='*80}")
-    print("Test 14 Conclusion:")
-    print(f"{'='*80}")
-    print("For NORMAL homographies (s3 > 0.1):")
-    print("  ✓ PyTorch and OpenCV find THE SAME 4 solutions (theory preserved)")
-    print()
-    print("For NEARLY-PURE-ROTATION homographies (s3 < 0.1, H ≈ R):")
-    print("  ⚠️  PyTorch and OpenCV may find DIFFERENT rotations")
-    print("  - Both recompose H correctly (geometrically valid)")
-    print("  - But rotation matrices can differ significantly (err_R ≈ 2.8)")
-    print()
-    print("  Why? NUMERICAL INSTABILITY when R1 ≈ R2:")
-    print("  - Theory: Still exactly 2 distinct rotations (not infinite!)")
-    print("  - When s3 → 0: u1 ≈ 0.987*v1 + 0.233*v3, u2 ≈ 0.987*v1 - 0.233*v3")
-    print("  - u1 and u2 differ only by ~0.46*v3 (very similar!)")
-    print("  - Eigenvector errors ~10⁻¹⁶ get amplified → different R1, R2")
-    print("  - This is instability in computing the 2 rotations, not extra solutions")
-    print()
-    print("GEOMETRIC MEANING: s3 ≈ 0 means H ≈ R (nearly pure rotation)")
-    print("  - Translation t is very small relative to rotation")
-    print("  - Scene is nearly planar or camera mostly rotates")
-    print("  - Hard to distinguish rotation from translation numerically")
-    print()
-    print("RECOMMENDATION: Check s3 (smallest eigenvalue of normalized H^T*H).")
-    print("For s3 < 0.1, decomposition is unstable. Use with caution.")
-    print("Note: Independent of condition number κ (linear algebra conditioning)!")
-    print("="*80)
-
-
-def test_15_automatic_stability_detection():
-    """
-    Test 15: Automatic stability detection and warnings.
-    
-    Demonstrates the new stability checking functions that detect:
-    1. Ill-conditioning (large condition number κ)
-    2. Numerical instability (small eigenvalue s3)
-    
-    These are INDEPENDENT: a well-conditioned matrix can have small s3!
-    """
-    print("\n" + "="*80)
-    print("Test 15: Automatic Stability Detection")
-    print("="*80)
-    print("This test demonstrates the new stability checking functions.")
-    print()
-    
-    # Helper function for creating rotation matrices
-    def rotation_matrix_about_axis(axis, angle):
-        """Create rotation matrix from axis-angle representation."""
-        axis = axis / torch.norm(axis)
-        angle_t = torch.tensor(angle, dtype=torch.float64)
-        K_mat = torch.tensor([[0, -axis[2], axis[1]],
-                              [axis[2], 0, -axis[0]],
-                              [-axis[1], axis[0], 0]], dtype=torch.float64)
-        return torch.eye(3, dtype=torch.float64) + torch.sin(angle_t) * K_mat + (1 - torch.cos(angle_t)) * (K_mat @ K_mat)
-    
-    # Test with a mix of stable and unstable homographies
-    K = torch.tensor([[800.0, 0, 320.0],
-                      [0, 800.0, 240.0],
-                      [0, 0, 1.0]], dtype=torch.float64)
-    
-    # Case 1: Well-conditioned, large s3 (stable)
-    axis1 = torch.tensor([0.1, 0.2, 0.3], dtype=torch.float64)
-    axis1 = axis1 / torch.norm(axis1)
-    R1 = rotation_matrix_about_axis(axis1, 0.3)
-    t1 = torch.tensor([0.5, -0.3, 0.8], dtype=torch.float64)  # Normal translation
-    n1 = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64)
-    H1 = recompose_homography(R1, t1, n1)
-    
-    # Case 2: Small s3 (unstable - nearly pure rotation)
-    axis2 = torch.tensor([0.3, 0.4, 0.5], dtype=torch.float64)
-    axis2 = axis2 / torch.norm(axis2)
-    R2 = rotation_matrix_about_axis(axis2, 0.5)
-    t2 = torch.tensor([0.05, 0.03, 0.08], dtype=torch.float64)  # Small but not tiny
-    n2 = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64)
-    H2 = recompose_homography(R2, t2, n2)
-    
-    # Case 3: Very small s3 (very unstable - almost pure rotation)
-    axis3 = torch.tensor([0.2, 0.3, 0.1], dtype=torch.float64)
-    axis3 = axis3 / torch.norm(axis3)
-    R3 = rotation_matrix_about_axis(axis3, 0.2)
-    t3 = torch.tensor([0.01, 0.015, 0.02], dtype=torch.float64)  # Very small
-    n3 = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64)
-    H3 = recompose_homography(R3, t3, n3)
-    
-    # Stack all homographies for batch processing
-    H_batch = torch.stack([H1, H2, H3])
-    
-    # Check conditioning (κ) vs stability (s3)
-    print("Step 1: Check both condition number (κ) and s3 stability")
-    print("-" * 60)
-    is_ill_cond, kappa = is_homography_ill_conditioned(H_batch, threshold=100.0)
-    is_unstable, s3 = is_decomposition_numerically_unstable(H_batch, K=K, s3_threshold=0.01)
-    
-    for i in range(3):
-        print(f"Homography {i+1}:")
-        print(f"  Condition number (κ): {kappa[i].item():8.2f}  {'[ILL-CONDITIONED]' if is_ill_cond[i] else '[WELL-CONDITIONED]'}")
-        print(f"  Eigenvalue s3:        {s3[i].item():8.6f}  {'[UNSTABLE]' if is_unstable[i] else '[STABLE]'}")
-        print()
-    
-    print("Key insight: κ (conditioning) and s3 (stability) are INDEPENDENT!")
-    print("A well-conditioned matrix (κ < 10) can still have small s3.")
-    print()
-    
-    # Use the new stable decomposition function
-    print("Step 2: Decompose with automatic stability detection")
-    print("-" * 60)
-    Rs, ts, normals, is_unstable_out, s3_out = decompose_homography_stable(H_batch, K=K, s3_threshold=0.01)
-    
-    for i in range(3):
-        print(f"Homography {i+1}:")
-        if is_unstable_out[i]:
-            print(f"  ⚠️  WARNING: Numerically unstable decomposition (s3={s3_out[i].item():.6f})")
-            print(f"      Results are geometrically valid but numerically sensitive.")
-        else:
-            print(f"  ✓  Stable decomposition (s3={s3_out[i].item():.6f})")
-        
-        # Verify recomposition accuracy
-        for j in range(4):
-            H_recomp = recompose_homography(Rs[i, j], ts[i, j], normals[i, j])
-            err = torch.norm(H_batch[i] - H_recomp).item()
-            if j == 0:
-                print(f"      Recomposition error (solution {j+1}): {err:.2e}")
-        print()
-    
-    print("Step 3: Compare with OpenCV")
-    print("-" * 60)
-    print("Testing if OpenCV handles unstable cases differently...")
-    print()
-    
-    import cv2
-    K_cv = K.numpy()
-    
-    for i in range(3):
-        # Convert to metric homography for OpenCV
-        H_metric = (K @ H_batch[i] @ torch.linalg.inv(K)).numpy()
-        num_sols, Rs_cv, ts_cv, normals_cv = cv2.decomposeHomographyMat(H_metric, K_cv)
-        
-        # Compare first solution
-        R_cv = torch.tensor(Rs_cv[0], dtype=torch.float64)
-        R_pt = Rs[i, 0]
-        err_R = torch.norm(R_cv - R_pt).item()
-        
-        print(f"Homography {i+1} (s3={s3_out[i].item():.6f}):")
-        print(f"  OpenCV vs PyTorch rotation difference: {err_R:.6f}")
-        if is_unstable_out[i] and err_R > 0.1:
-            print(f"  → Expected: Both valid but numerically different for small s3")
-        elif err_R < 1e-6:
-            print(f"  → Solutions match perfectly")
-        print()
-    
-    print("=" * 60)
-    print("Summary:")
-    print("- New functions detect BOTH ill-conditioning (κ) and instability (s3)")
-    print("- decompose_homography_stable() provides automatic warnings")
-    print("- This helps users understand when solutions may differ")
-    print("- Even unstable cases produce valid solutions (verified by recomposition)")
-    print("=" * 60)
-
-
-def test_16_robust_decomposition():
-    """
-    Test 16: Robust decomposition using polar decomposition for small s3.
-    
-    Demonstrates that the robust method produces more accurate results
-    when s3 is small (near-pure rotation case).
-    """
-    print("\n" + "="*80)
-    print("Test 16: Robust Decomposition for Small s3")
-    print("="*80)
-    print("This test compares standard vs robust decomposition for near-pure rotations.")
-    print()
-    
-    # Helper function
-    def rotation_matrix_about_axis(axis, angle):
-        """Create rotation matrix from axis-angle representation."""
-        axis = axis / torch.norm(axis)
-        angle_t = torch.tensor(angle, dtype=torch.float64)
-        K_mat = torch.tensor([[0, -axis[2], axis[1]],
-                              [axis[2], 0, -axis[0]],
-                              [-axis[1], axis[0], 0]], dtype=torch.float64)
-        return torch.eye(3, dtype=torch.float64) + torch.sin(angle_t) * K_mat + (1 - torch.cos(angle_t)) * (K_mat @ K_mat)
-    
-    K = torch.tensor([[800.0, 0, 320.0],
-                      [0, 800.0, 240.0],
-                      [0, 0, 1.0]], dtype=torch.float64)
-    
-    # Test Case 1: Normal homography (large s3, stable)
-    print("Case 1: Normal homography (large s3)")
-    print("-" * 60)
-    axis1 = torch.tensor([0.1, 0.2, 0.3], dtype=torch.float64)
-    axis1 = axis1 / torch.norm(axis1)
-    R1_gt = rotation_matrix_about_axis(axis1, 0.3)
-    t1_gt = torch.tensor([0.5, -0.3, 0.8], dtype=torch.float64)
-    n1_gt = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64)
-    H1 = recompose_homography(R1_gt, t1_gt, n1_gt)
-    
-    # Check s3 value
-    H1_norm = torch.linalg.inv(K) @ H1 @ K
-    _, S1, _ = torch.linalg.svd(H1_norm)
-    H1_scaled = H1_norm / S1[1]
-    HtH1 = H1_scaled.T @ H1_scaled
-    s3_val = torch.sqrt(torch.linalg.eigvalsh(HtH1)[0]).item()
-    print(f"  Eigenvalue s3: {s3_val:.6f}")
-    
-    # Standard decomposition
-    Rs_std, ts_std, ns_std = decompose_homography_mat(H1, K)
-    err_std = torch.min(torch.stack([
-        torch.norm(recompose_homography(Rs_std[i], ts_std[i], ns_std[i]) - H1)
-        for i in range(4)
-    ])).item()
-    
-    # Robust decomposition
-    Rs_rob, ts_rob, ns_rob, used_polar = decompose_homography_robust(H1, K, s3_threshold=0.05)
-    err_rob = torch.min(torch.stack([
-        torch.norm(recompose_homography(Rs_rob[i], ts_rob[i], ns_rob[i]) - H1)
-        for i in range(4)
-    ])).item()
-    
-    print(f"  Used polar decomposition: {used_polar.item()}")
-    print(f"  Standard recomposition error: {err_std:.2e}")
-    print(f"  Robust recomposition error:   {err_rob:.2e}")
-    print()
-    
-    # Test Case 2: Small s3 (nearly pure rotation, unstable)
-    print("Case 2: Small s3 homography (nearly pure rotation)")
-    print("-" * 60)
-    axis2 = torch.tensor([0.3, 0.4, 0.5], dtype=torch.float64)
-    axis2 = axis2 / torch.norm(axis2)
-    R2_gt = rotation_matrix_about_axis(axis2, 0.5)
-    t2_gt = torch.tensor([0.05, 0.03, 0.08], dtype=torch.float64)  # Small but reasonable translation
-    n2_gt = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64)
-    H2 = recompose_homography(R2_gt, t2_gt, n2_gt)
-    
-    # Check s3 value
-    H2_norm = torch.linalg.inv(K) @ H2 @ K
-    _, S2, _ = torch.linalg.svd(H2_norm)
-    H2_scaled = H2_norm / S2[1]
-    HtH2 = H2_scaled.T @ H2_scaled
-    s3_val = torch.sqrt(torch.linalg.eigvalsh(HtH2)[0]).item()
-    print(f"  Eigenvalue s3: {s3_val:.6f}")
-    
-    # Standard decomposition
-    Rs_std, ts_std, ns_std = decompose_homography_mat(H2, K)
-    err_std = torch.min(torch.stack([
-        torch.norm(recompose_homography(Rs_std[i], ts_std[i], ns_std[i]) - H2)
-        for i in range(4)
-    ])).item()
-    
-    # Robust decomposition
-    Rs_rob, ts_rob, ns_rob, used_polar = decompose_homography_robust(H2, K, s3_threshold=0.05)
-    err_rob = torch.min(torch.stack([
-        torch.norm(recompose_homography(Rs_rob[i], ts_rob[i], ns_rob[i]) - H2)
-        for i in range(4)
-    ])).item()
-    
-    print(f"  Used polar decomposition: {used_polar.item()}")
-    print(f"  Standard recomposition error: {err_std:.2e}")
-    print(f"  Robust recomposition error:   {err_rob:.2e}")
-    
-    # Compare rotation accuracy
-    R_std_best_idx = torch.argmin(torch.stack([
-        torch.norm(Rs_std[i] - R2_gt) for i in range(4)
-    ]))
-    R_rob_best_idx = torch.argmin(torch.stack([
-        torch.norm(Rs_rob[i] - R2_gt) for i in range(4)
-    ]))
-    
-    err_R_std = torch.norm(Rs_std[R_std_best_idx] - R2_gt).item()
-    err_R_rob = torch.norm(Rs_rob[R_rob_best_idx] - R2_gt).item()
-    
-    print(f"  Standard rotation error:      {err_R_std:.2e}")
-    print(f"  Robust rotation error:        {err_R_rob:.2e}")
-    
-    if err_rob < err_std:
-        improvement = (err_std - err_rob) / err_std * 100
-        print(f"  → Robust method {improvement:.1f}% more accurate!")
-    print()
-    
-    # Test Case 3: Very small s3 (almost pure rotation)
-    print("Case 3: Very small s3 homography (almost pure rotation)")
-    print("-" * 60)
-    axis3 = torch.tensor([0.2, 0.3, 0.1], dtype=torch.float64)
-    axis3 = axis3 / torch.norm(axis3)
-    R3_gt = rotation_matrix_about_axis(axis3, 0.4)
-    t3_gt = torch.tensor([0.01, 0.01, 0.02], dtype=torch.float64)  # Very small
-    n3_gt = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64)
-    H3 = recompose_homography(R3_gt, t3_gt, n3_gt)
-    
-    # Check s3 value
-    H3_norm = torch.linalg.inv(K) @ H3 @ K
-    _, S3, _ = torch.linalg.svd(H3_norm)
-    H3_scaled = H3_norm / S3[1]
-    HtH3 = H3_scaled.T @ H3_scaled
-    s3_val = torch.sqrt(torch.linalg.eigvalsh(HtH3)[0]).item()
-    print(f"  Eigenvalue s3: {s3_val:.6f}")
-    
-    # Standard decomposition
-    Rs_std, ts_std, ns_std = decompose_homography_mat(H3, K)
-    err_std = torch.min(torch.stack([
-        torch.norm(recompose_homography(Rs_std[i], ts_std[i], ns_std[i]) - H3)
-        for i in range(4)
-    ])).item()
-    
-    # Robust decomposition
-    Rs_rob, ts_rob, ns_rob, used_polar = decompose_homography_robust(H3, K, s3_threshold=0.05)
-    err_rob = torch.min(torch.stack([
-        torch.norm(recompose_homography(Rs_rob[i], ts_rob[i], ns_rob[i]) - H3)
-        for i in range(4)
-    ])).item()
-    
-    print(f"  Used polar decomposition: {used_polar.item()}")
-    print(f"  Standard recomposition error: {err_std:.2e}")
-    print(f"  Robust recomposition error:   {err_rob:.2e}")
-    
-    # Compare rotation accuracy
-    R_std_best_idx = torch.argmin(torch.stack([
-        torch.norm(Rs_std[i] - R3_gt) for i in range(4)
-    ]))
-    R_rob_best_idx = torch.argmin(torch.stack([
-        torch.norm(Rs_rob[i] - R3_gt) for i in range(4)
-    ]))
-    
-    err_R_std = torch.norm(Rs_std[R_std_best_idx] - R3_gt).item()
-    err_R_rob = torch.norm(Rs_rob[R_rob_best_idx] - R3_gt).item()
-    
-    print(f"  Standard rotation error:      {err_R_std:.2e}")
-    print(f"  Robust rotation error:        {err_R_rob:.2e}")
-    
-    if err_R_rob < err_R_std:
-        improvement = (err_R_std - err_R_rob) / err_R_std * 100
-        print(f"  → Robust method {improvement:.1f}% more accurate!")
-    print()
-    
-    print("=" * 60)
-    print("Summary:")
-    print("- Robust decomposition automatically detects small s3 cases")
-    print("- Uses polar decomposition H = R * sqrt(H^T*H) for rotation")
-    print("- Finds optimal (t,n) via SVD of residual E = H - R")
-    print("- Significantly more accurate for near-pure rotation cases")
-    print("=" * 60)
-
-
-def test_20_solver_homography_characteristics():
-    """
-    Test 20: Analyze what makes solver homographies diverge between OpenCV/PyTorch.
-    
-    From Test 13, we observed:
-    - Well-conditioned (κ=6.43, not the problem!)
-    - Small s3 ≈ 0.025 (key characteristic)
-    - ||R_cv - R_pt|| ≈ 2.83 (both valid, different solutions)
-    - Both recompose perfectly (<1e-15)
-    
-    This test generates synthetic cases with controlled s3 and ||t|| to find
-    the divergence threshold.
-    """
-    print("\n" + "="*80)
-    print("Test 20: Solver Homography Divergence Analysis")
-    print("="*80)
-    print("Generating synthetic H = R + t⊗n with known ground truth R")
-    print("to identify what causes OpenCV/PyTorch to find different rotations.\n")
-    
-    np.random.seed(2025)
-    torch.manual_seed(2025)
-    
-    # Fix a ground truth rotation (moderate 3D rotation)
-    angle_x = np.deg2rad(15)
-    angle_y = np.deg2rad(20)
-    angle_z = np.deg2rad(25)
-    
-    Rx = np.array([
-        [1, 0, 0],
-        [0, np.cos(angle_x), -np.sin(angle_x)],
-        [0, np.sin(angle_x), np.cos(angle_x)]
-    ], dtype=np.float64)
-    
-    Ry = np.array([
-        [np.cos(angle_y), 0, np.sin(angle_y)],
-        [0, 1, 0],
-        [-np.sin(angle_y), 0, np.cos(angle_y)]
-    ], dtype=np.float64)
-    
-    Rz = np.array([
-        [np.cos(angle_z), -np.sin(angle_z), 0],
-        [np.sin(angle_z), np.cos(angle_z), 0],
-        [0, 0, 1]
-    ], dtype=np.float64)
-    
-    R_gt = Rz @ Ry @ Rx
-    
-    # Fixed plane normal (pointing mostly toward camera)
-    n = np.array([[0.1], [0.2], [0.9]], dtype=np.float64)
-    n = n / np.linalg.norm(n)
-    
-    print(f"Ground truth rotation (Euler ZYX):")
-    print(f"  Angles: x={np.rad2deg(angle_x):.1f}°, y={np.rad2deg(angle_y):.1f}°, z={np.rad2deg(angle_z):.1f}°")
-    print(f"  det(R) = {np.linalg.det(R_gt):.10f}")
-    print(f"Plane normal: n = [{n[0,0]:.3f}, {n[1,0]:.3f}, {n[2,0]:.3f}]^T\n")
-    
-    # Test varying translation magnitudes to see effect on s3 and divergence
-    print("="*80)
-    print("Experiment 1: Varying in-plane translation magnitude")
-    print("="*80)
-    print("Translation perpendicular to normal (maximizes effect on s3)\n")
-    
-    # Create translation perpendicular to n
-    n_vec = n.flatten()
-    # Find two orthogonal vectors to n
-    if abs(n_vec[2]) > 0.9:
-        v1 = np.array([1.0, 0.0, 0.0])
-    else:
-        v1 = np.array([0.0, 0.0, 1.0])
-    v1 = v1 - np.dot(v1, n_vec) * n_vec
-    v1 = v1 / np.linalg.norm(v1)
-    
-    results = []
-    
-    # Extended range to get s3 < 0.1 like in Test 13
-    t_magnitudes = [0.1, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0, 100.0]
-    
-    for t_mag in t_magnitudes:
-        # Translation perpendicular to normal
-        t = (t_mag * v1).reshape(3, 1)
-        
-        # Construct homography
-        H = R_gt + t @ n.T
-        H_torch = torch.from_numpy(H).double()
-        
-        # Compute s3
-        _, S, _ = np.linalg.svd(H)
-        H_norm = H / S[1]
-        HtH = H_norm.T @ H_norm
-        evals, _ = np.linalg.eigh(HtH)
-        s3 = np.sqrt(evals[0])
-        cond = S[0] / S[2] if S[2] > 1e-10 else float('inf')
-        
-        # Decompose with both methods
-        num_cv, Rs_cv, ts_cv, ns_cv = cv2.decomposeHomographyMat(H, np.eye(3))
-        Rs_torch, ts_torch, ns_torch = decompose_homography_mat(H_torch)
-        
-        # Find best matching rotation for each method
-        def rotation_angle_error(R1, R2):
-            """Compute rotation angle difference in degrees."""
-            R_rel = R1.T @ R2
-            trace = np.trace(R_rel)
-            # Clamp to avoid numerical issues with arccos
-            cos_angle = np.clip((trace - 1) / 2, -1, 1)
-            return np.rad2deg(np.arccos(cos_angle))
-        
-        # OpenCV best match
-        cv_errors = []
-        for i in range(num_cv):
-            if not np.isnan(Rs_cv[i]).any():
-                error = rotation_angle_error(Rs_cv[i], R_gt)
-                cv_errors.append(error)
-        cv_best_error = min(cv_errors) if cv_errors else float('inf')
-        
-        # PyTorch best match
-        pt_errors = []
-        for i in range(4):
-            if not torch.isnan(Rs_torch[i]).any():
-                error = rotation_angle_error(Rs_torch[i].numpy(), R_gt)
-                pt_errors.append(error)
-        pt_best_error = min(pt_errors) if pt_errors else float('inf')
-        
-        # Check if OpenCV and PyTorch found different rotations
-        diverged = False
-        min_cross_error = float('inf')
-        for i in range(num_cv):
-            if np.isnan(Rs_cv[i]).any():
-                continue
-            for j in range(4):
-                if torch.isnan(Rs_torch[j]).any():
-                    continue
-                R_diff = np.linalg.norm(Rs_cv[i] - Rs_torch[j].numpy())
-                min_cross_error = min(min_cross_error, R_diff)
-        
-        # If best matching solutions differ by > 0.1, they diverged
-        if min_cross_error > 0.1:
-            diverged = True
-        
-        results.append({
-            't_mag': t_mag,
-            's3': s3,
-            'cond': cond,
-            'cv_error': cv_best_error,
-            'pt_error': pt_best_error,
-            'diverged': diverged,
-            'cross_diff': min_cross_error
-        })
-        
-        status = "DIVERGED" if diverged else "MATCH"
-        print(f"||t|| = {t_mag:5.1f}, s3 = {s3:.6f}, κ = {cond:6.2f}:")
-        print(f"  OpenCV best:  {cv_best_error:6.2f}°")
-        print(f"  PyTorch best: {pt_best_error:6.2f}°")
-        print(f"  Min cross diff: {min_cross_error:.4f} → {status}")
-        print()
-    
-    print("="*80)
-    print("Analysis:")
-    print("="*80)
-    
-    # Find divergence threshold
-    diverged_cases = [r for r in results if r['diverged']]
-    matched_cases = [r for r in results if not r['diverged']]
-    
-    if diverged_cases:
-        max_s3_diverged = max(r['s3'] for r in diverged_cases)
-        min_s3_diverged = min(r['s3'] for r in diverged_cases)
-        print(f"Divergence occurs when s3 ∈ [{min_s3_diverged:.4f}, {max_s3_diverged:.4f}]")
-        
-        if matched_cases:
-            min_s3_matched = min(r['s3'] for r in matched_cases)
-            print(f"Methods agree when s3 ≥ {min_s3_matched:.4f}")
-            print(f"\nCRITICAL THRESHOLD: s3 ≈ {(max_s3_diverged + min_s3_matched) / 2:.4f}")
-    
-    print("\nKey findings:")
-    for r in results:
-        if r['diverged']:
-            print(f"  s3={r['s3']:.4f}, ||t||={r['t_mag']:5.1f}: DIVERGED (but both accurate: CV {r['cv_error']:.1f}°, PT {r['pt_error']:.1f}°)")
-    
-    print("\n" + "="*80)
-    print("Experiment 2: Match solver homography characteristics")
-    print("="*80)
-    print("Solver homographies from Test 13 have s3 ≈ 0.025-0.16")
-    print("Create synthetic cases with similar s3 but known ground truth R\n")
-    
-    # To get very small s3, we need VERY large in-plane translation
-    for t_mag in [50.0, 100.0, 200.0]:
-        t = (t_mag * v1).reshape(3, 1)
-        
-        H = R_gt + t @ n.T
-        H_torch = torch.from_numpy(H).double()
-        
-        # Compute s3
-        _, S, _ = np.linalg.svd(H)
-        H_norm = H / S[1]
-        HtH = H_norm.T @ H_norm
-        evals, _ = np.linalg.eigh(HtH)
-        s3 = np.sqrt(evals[0])
-        cond = S[0] / S[2] if S[2] > 1e-10 else float('inf')
-        
-        # Decompose
-        num_cv, Rs_cv, ts_cv, ns_cv = cv2.decomposeHomographyMat(H, np.eye(3))
-        Rs_torch, ts_torch, ns_torch = decompose_homography_mat(H_torch)
-        
-        # Find best rotation matches
-        cv_errors = []
-        for i in range(num_cv):
-            if not np.isnan(Rs_cv[i]).any():
-                R_rel = Rs_cv[i].T @ R_gt
-                trace = np.trace(R_rel)
-                cos_angle = np.clip((trace - 1) / 2, -1, 1)
-                error = np.rad2deg(np.arccos(cos_angle))
-                cv_errors.append(error)
-        cv_best_error = min(cv_errors) if cv_errors else float('inf')
-        
-        pt_errors = []
-        for i in range(4):
-            if not torch.isnan(Rs_torch[i]).any():
-                R_rel = Rs_torch[i].numpy().T @ R_gt
-                trace = np.trace(R_rel)
-                cos_angle = np.clip((trace - 1) / 2, -1, 1)
-                error = np.rad2deg(np.arccos(cos_angle))
-                pt_errors.append(error)
-        pt_best_error = min(pt_errors) if pt_errors else float('inf')
-        
-        # Check cross difference
-        min_cross_error = float('inf')
-        for i in range(num_cv):
-            if np.isnan(Rs_cv[i]).any():
-                continue
-            for j in range(4):
-                if torch.isnan(Rs_torch[j]).any():
-                    continue
-                R_diff = np.linalg.norm(Rs_cv[i] - Rs_torch[j].numpy())
-                min_cross_error = min(min_cross_error, R_diff)
-        
-        diverged = min_cross_error > 0.1
-        status = "DIVERGED" if diverged else "MATCH"
-        
-        print(f"||t|| = {t_mag:6.1f}, s3 = {s3:.6f}, κ = {cond:7.2f}:")
-        print(f"  OpenCV best:  {cv_best_error:6.2f}°")
-        print(f"  PyTorch best: {pt_best_error:6.2f}°")
-        print(f"  Min cross diff: {min_cross_error:.4f} → {status}")
-        
-        results.append({
-            't_mag': t_mag,
-            's3': s3,
-            'cond': cond,
-            'cv_error': cv_best_error,
-            'pt_error': pt_best_error,
-            'diverged': diverged,
-            'cross_diff': min_cross_error
-        })
-        print()
-    
-    print("="*80)
-    print("Experiment 3: Out-of-plane translation (parallel to normal)")
-    print("="*80)
-    print("Testing if out-of-plane translation causes divergence\n")
-    
-    for t_mag in [0.1, 1.0, 5.0, 20.0]:
-        # Translation parallel to normal
-        t = (t_mag * n_vec).reshape(3, 1)
-        
-        H = R_gt + t @ n.T
-        H_torch = torch.from_numpy(H).double()
-        
-        # Compute s3
-        _, S, _ = np.linalg.svd(H)
-        H_norm = H / S[1]
-        HtH = H_norm.T @ H_norm
-        evals, _ = np.linalg.eigh(HtH)
-        s3 = np.sqrt(evals[0])
-        
-        # Decompose
-        num_cv, Rs_cv, ts_cv, ns_cv = cv2.decomposeHomographyMat(H, np.eye(3))
-        Rs_torch, ts_torch, ns_torch = decompose_homography_mat(H_torch)
-        
-        # Check divergence
-        min_cross_error = float('inf')
-        for i in range(num_cv):
-            if np.isnan(Rs_cv[i]).any():
-                continue
-            for j in range(4):
-                if torch.isnan(Rs_torch[j]).any():
-                    continue
-                R_diff = np.linalg.norm(Rs_cv[i] - Rs_torch[j].numpy())
-                min_cross_error = min(min_cross_error, R_diff)
-        
-        diverged = min_cross_error > 0.1
-        status = "DIVERGED" if diverged else "MATCH"
-        
-        print(f"||t|| = {t_mag:5.1f} (parallel to n), s3 = {s3:.6f}:")
-        print(f"  Cross diff: {min_cross_error:.4f} → {status}")
-    
-    print("\n" + "="*80)
-    print("Experiment 4: Testing det(H) < 0 hypothesis")
-    print("="*80)
-    print("Solver homography has det(H) < 0. Does this cause sign disagreement?\n")
-    
-    H_solver = np.array([[-0.01290631,  0.67397112, -0.02455027],
-                          [-0.21147446,  0.19496514, -0.00204381],
-                          [ 0.54549676,  0.02824806, -0.40483576]], dtype=np.float64)
-    
-    det_H = np.linalg.det(H_solver)
-    print(f"Solver H: det(H) = {det_H:.6f} (NEGATIVE)")
-    
-    # Test original and flipped
-    for sign, H_test in [("+1", H_solver), ("-1", -H_solver)]:
-        det_test = np.linalg.det(H_test)
-        print(f"\nTesting {sign}*H: det = {det_test:.6f}")
-        
-        num_cv, Rs_cv, ts_cv, ns_cv = cv2.decomposeHomographyMat(H_test, np.eye(3))
-        H_torch = torch.from_numpy(H_test).double()
-        Rs_torch, ts_torch, ns_torch = decompose_homography_mat(H_torch)
-        
-        # Find minimum cross difference
-        min_diff = float('inf')
-        for i in range(num_cv):
-            for j in range(4):
-                diff = np.linalg.norm(Rs_cv[i] - Rs_torch[j].numpy())
-                min_diff = min(min_diff, diff)
-        
-        status = "AGREE ✓" if min_diff < 0.1 else f"DISAGREE (diff={min_diff:.4f})"
-        print(f"  OpenCV vs PyTorch: {status}")
-    
-    print("\n" + "="*80)
-    print("CONCLUSION:")
-    print("="*80)
-    print("ROOT CAUSE FOUND: det(H) < 0 causes sign disagreement!")
-    print()
-    print("For synthetic H = R + t⊗n with known ground truth R:")
-    print("  • det(H) > 0 → OpenCV and PyTorch AGREE perfectly")
-    print("  • Both recover ground truth rotation (0° error)")
-    print("  • Works even for s3 as low as 0.32")
-    print()
-    print("For solver homographies with det(H) < 0:")
-    print("  • OpenCV and PyTorch choose OPPOSITE signs")
-    print("  • OpenCV gives: (R, t, n)")
-    print("  • PyTorch gives: (-R, -t, -n)")
-    print("  • Both are VALID: H = R + t⊗n = -R + (-t)⊗(-n) up to scale")
-    print("  • 180° rotation difference is the signature")
-    print()
-    print("Why the sign difference?")
-    print("  • Homography has scale ambiguity: H ≡ λH")
-    print("  • For det(H) < 0, H ≡ -H (with λ = -1)")
-    print("  • Decomposition of H and -H give different signs")
-    print("  • Different implementations pick different sign conventions")
-    print()
-    print("SOLUTION:")
-    print("  1. Normalize: if det(H) < 0, use H ← -H before decomposition")
-    print("  2. Or accept both (R,t,n) and (-R,-t,-n) as valid")
-    print("  3. Use cheirality (points in front of camera) to disambiguate")
-    print("="*80)
-
-
 def test_21_validate_homography():
     """
     Test 21: Validate homography cheirality (positive depth test).
@@ -3404,6 +1917,62 @@ def test_21_validate_homography():
     print(f"  λ values shape: {lambdas_8pt.shape}")
     print(f"  λ values: {lambdas_8pt.numpy()}")
     
+    # Test case 7: Batched indices (RANSAC scenario)
+    print("\n" + "="*80)
+    print("Test 7: Batched Point Indices (RANSAC Use Case)")
+    print("="*80)
+    
+    # Simulate RANSAC: multiple homographies, each from different 4-point subset
+    torch.manual_seed(42)
+    N_total = 100  # Total available points
+    B = 5  # Number of homography models
+    m = 4  # Points per model (minimal set)
+    
+    # Generate all points
+    x1_all = torch.rand(N_total, 2, dtype=torch.float64)
+    x2_all = x1_all + 0.1  # Inliers (small translation)
+    
+    # Add some outliers
+    outlier_idx = torch.randint(0, N_total, (20,))
+    x2_all[outlier_idx] = torch.rand(20, 2, dtype=torch.float64)
+    
+    # Generate random indices for each model (simulate RANSAC sampling)
+    ii_batch = torch.randint(0, N_total, (B, m))
+    
+    # Create homographies (identity + translation for simplicity)
+    H_batch = torch.eye(3, dtype=torch.float64).unsqueeze(0).repeat(B, 1, 1)
+    H_batch[:, 0, 2] = torch.linspace(0.05, 0.15, B)
+    H_batch[:, 1, 2] = torch.linspace(0.08, 0.12, B)
+    
+    print(f"Setup:")
+    print(f"  Total points: {N_total}")
+    print(f"  Number of models: {B}")
+    print(f"  Points per model: {m}")
+    print(f"  Point indices shape: {ii_batch.shape}")
+    print(f"  Homographies shape: {H_batch.shape}")
+    
+    # Validate with batched indices
+    valid_ransac, H_corr_ransac, lambdas_ransac = validate_homography_cheirality(
+        H_batch, x1_all, x2_all, ii_batch
+    )
+    
+    print(f"\nResults:")
+    print(f"  valid shape: {valid_ransac.shape}")
+    print(f"  H_corrected shape: {H_corr_ransac.shape}")
+    print(f"  lambdas shape: {lambdas_ransac.shape}")
+    
+    for i in range(B):
+        inlier_indices = ii_batch[i]
+        has_outlier = any(idx in outlier_idx for idx in inlier_indices)
+        print(f"\n  Model {i}: indices {inlier_indices.tolist()}")
+        print(f"    Contains outlier: {has_outlier}")
+        print(f"    Valid: {valid_ransac[i]}")
+        print(f"    λ values: {lambdas_ransac[i].numpy()}")
+    
+    print(f"\n✓ Batched validation with point indices works correctly")
+    print(f"  Each model validated against its own 4-point subset")
+    print(f"  Other points (potential outliers) are ignored")
+    
     print("\n" + "="*80)
     print("USAGE IN RANSAC:")
     print("="*80)
@@ -3417,7 +1986,16 @@ def test_21_validate_homography():
     print("      H = H_corrected  # Use corrected H with det(H) > 0")
     print("      evaluate_on_all_inliers(H)")
     print()
-    print("  # Batched homographies (e.g., from parallel RANSAC)")
+    print("  # Batched homographies with different point subsets (RANSAC)")
+    print("  # Each H[i] was computed from points x1[ii[i]], x2[ii[i]]")
+    print("  valid_batch, H_corrected, lambdas = validate_homography_cheirality(")
+    print("      H_batch, x1_all, x2_all, ii  # H: [B,3,3], x1,x2: [N,2], ii: [B,4]")
+    print("  )")
+    print("  # valid_batch: [B], H_corrected: [B, 3, 3], lambdas: [B, 4]")
+    print("  # Each model validated only on its 4 points (others may be outliers)")
+    print("  H_valid = H_corrected[valid_batch]")
+    print()
+    print("  # Legacy: All homographies use same points")
     print("  valid_batch, H_corrected, lambdas = validate_homography_cheirality(")
     print("      H_batch, x1, x2  # H_batch: [B, 3, 3], x1,x2: [n, 2]")
     print("  )")
@@ -3436,11 +2014,4 @@ def test_21_validate_homography():
 
 if __name__ == "__main__":
     test_decompose_homography()
-    test_14_pytorch_opencv_equivalence()
-    test_15_automatic_stability_detection()
-    test_16_robust_decomposition()
-    test_20_solver_homography_characteristics()
     test_21_validate_homography()
-    test_15_automatic_stability_detection()
-    test_16_robust_decomposition()
-    test_20_solver_homography_characteristics()

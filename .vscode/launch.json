@@ -18,5 +18,13 @@
             "program": "evaluate_H.py",
             "console": "integratedTerminal"
         }
+        {
+            "name": "evaluate.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "evaluate.py",
+            "console": "integratedTerminal"
+        }
+
     ]
 }

@@ -22,6 +22,7 @@ from argparse import ArgumentParser
 import warnings
 import itertools
 import poselib
+from tqdm import tqdm
 from scipy.spatial.transform import Rotation as TR
 #!%matplotlib inline
 
@@ -37,8 +38,6 @@ from . import local_optimization as LO
 from .drawing import *
 
 from . import model_H
-from .model_H import new_minimal_models, pose_error_batch_torch, AUC_10, compute_residuals
-
 
 op = ArgumentParser()
 op.add_argument("--batch_size", type=int, default=8, help="number of pairs processed in parallel")
@@ -46,7 +45,7 @@ op.add_argument("--val_samples", type=int, default=1000, help="number of minimal
 op.add_argument("--val_pairs", type=int, default=1000, help="number of image pairings per scene used for validation")
 op.add_argument("--val_thresholds", type=int, default=200, help="grid of thresholds subdividing [0.1 10] for validation")
 op.add_argument("--N_bins", type=int, default=500, help="histogram size for residuals")
-op.add_argument("--max_distance", type=float, default=10.0, help="max distance for the histogram")
+op.add_argument("--max_distance", type=float, default=30.0, help="max distance for the histogram")
 op.add_argument("--polish", default=0, type=str, help="0 - no polish, 1 - BA, 2 - LMeDs, GaU - our polish (EM-LMA GaU) , MSAC - our polish (EM-LMA MSAC)")
 op.add_argument("--data", type=str, default='HEB', help="dataset")
 op.add_argument("-V", "--validate", action='store_true', default=False, help="recompute validation")
@@ -56,22 +55,26 @@ op.add_argument("--kde", action='store_true', default=False, help="?")
 op.add_argument("--geom", action='store_true', default=False, help="error geometry analysis")
 op.add_argument("--inliers", action='store_true', default=False, help="inliers statistics experiment")
 op.add_argument("--static", action='store_true', default=False, help="static 1K test, DEPRICATED")
-op.add_argument("--var", type=bool, default=False, help="variance test")
+# op.add_argument("--var", type=bool, default=False, help="variance test")
+op.add_argument("--var", action='store_true', default=False, help="variance test")
+op.add_argument("--largeval", action='store_true', default=False, help="variance test")
 op.add_argument("--F", action='store_true', default=False, help="use solver for F matrix (regardless of the dataset)")
-op.add_argument("--new_models", type=bool, default=True, help="sample new models, cannot be changed")
+# DEPRICATED
+# op.add_argument("--new_models", type=bool, default=True, help="sample new models, cannot be changed")
 
 args_str = ' '.join(sys.argv[1:])
 ops, args = op.parse_known_args(shlex.split(args_str))
 o = SimpleNamespace(**vars(ops))
 ## 
 ## For interactove model
-o.validate = True
+# o.validate = True
 # o.F = True
 # o.geom = True
 # o.inliers = True
-o.R = True
-# o.var = True
+# o.R = True
+o.var = True
 # o.var = False
+o.largeval = True
 ##
 ##
 
@@ -87,6 +90,14 @@ if polish == 0:
 elif not (polish == 'GaU' or polish == 'MSAC'):
     print("undefined polishing method!")
 
+if o.polish == 'all':
+    polishes = [0, 'GaU', 'TRUNCATED', 'CAUCHY', 'TRUNCATED_LE_ZACH']
+elif o.polish == 0:
+    polishes = [0]
+else:
+    polishes = [o.polish]
+
+
 for dataset_info in datasets:
     if dataset_info.name == o.data:
         break
@@ -97,16 +108,25 @@ if dataset_info.name != o.data:
 o.type = dataset_info.type
 
 if dataset_info.type == 'H':
-    o.avg_solutions = 1
+    from .model_H import new_minimal_models, pose_error_batch_torch, AUC_10, compute_residuals
     o.minimal_sample = 4
+    o.avg_solutions = 1
     o.min_solver = model_H.solve_homography
     o.MAGSAC_dof = 2
+
+else:
+    from .model_E import new_minimal_models, pose_error_batch_torch, AUC_10, compute_residuals
+    o.minimal_sample = 5
+    o.avg_solutions = 1
+    o.MAGSAC_dof = 4
 
 
 Eval_GCMAGSAC = False
 
-# val_scenes = dataset_info.val[0:1]
-val_scenes = dataset_info.test[1:2]
+val_scenes = dataset_info.val
+# val_scenes = dataset_info.test[1:2]
+# val_scenes = dataset_info.val + dataset_info.test[0:4]
+# val_scenes = dataset_info.val + dataset_info.test
 test_scenes = dataset_info.test
 res_root = f'results/{dataset_info.name}/'
 results_file0 = res_root + f'polish={polish}/' + f'test_results.pkl'
@@ -118,9 +138,8 @@ val_file = res_root + f'val_results.pkl'
 
 def create_loader(val_src):
     if dataset_info.type == 'H':
-        dataset = H_dataset(dataset_info, val_src, padding=True)
+        dataset = H_dataset(dataset_info, val_src, padding=True, snn_threshold=0.7)
     else:
-        raise NotImplementedError()
         dataset = ResidualData(dataset_info, val_src, padding=True) # padding the 
     loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, num_workers=0, shuffle=True)
     return loader
@@ -274,7 +293,7 @@ def evaluate(loader, mode):
 
         if idx % 10 == 0:
             print(idx*o.batch_size)
-        if idx > 3:
+        if idx > 500:
             break # DEBUG
     # concatenate all batch results
     for m in methods:
@@ -311,12 +330,14 @@ def evaluate_T(loader, n_pairs):
         ss = sufficient_statistic(R, N_bins, max_distance=max_distance, pow=1)  # [B M K]
         for M in methods:
             if isinstance(M, MethodGT) or isinstance(M, Oracle) or hasattr(M, 'locked'):
-                continue
-            M.to(R)
-            scores = torch.einsum('bmK, ...K ->bm...',ss.counts, M.M) # [B M T]
-            best_s, best_idx = scores.max(dim=1)  # [B T] / [B]
-            best_s = best_s.cpu()
-            best_idx = best_idx.cpu()
+                if isinstance(M, Oracle):
+                    best_idx = errors.argmin(dim=-1) # oracle has access to GT error function
+            else:
+                M.to(R)
+                scores = torch.einsum('bmK, ...K ->bm...',ss.counts, M.M) # [B M T]
+                best_s, best_idx = scores.max(dim=1)  # [B T] / [B]
+                best_s = best_s.cpu()
+                best_idx = best_idx.cpu()
             best_e = select_dim1(errors, best_idx)  # error of the best model [B, T]
             best_r = select_dim1(errors_r, best_idx)  # error of the best model [B, T]
             best_t = select_dim1(errors_t, best_idx)  # error of the best model [B, T]
@@ -334,20 +355,7 @@ def evaluate_T(loader, n_pairs):
                 eval_results[n][k] = np.concatenate(eval_results[n][k], axis=0) # [B, T]
     return eval_results
 
-
-MAX_SOLUTIONS = 10
-
-
-if o.polish == 'all':
-    polishes = [0, 'GaU', 'TRUNCATED', 'CAUCHY', 'TRUNCATED_LE_ZACH']
-elif o.polish == 0:
-    polishes = [0]
-else:
-    polishes = [o.polish]
-    
-# polishes = [0, 'GaU', 'TRUNCATED', 'CAUCHY', 'TRUNCATED_LE_ZACH']
-# polishes = [0, 'TRUNCATED']
-
+   
 def npstack(arrays):
     return np.stack(arrays) if len(arrays)>0 else np.zeros(shape =(0,0))
 
@@ -627,7 +635,7 @@ def npstack(arrays):
 
 # %%  _________Construct / Load models______________
 print('________Construct / Load models___________')
-max_distance = 10; N_bins = 500 # filter to select models to evaluate
+max_distance = o.max_distance; N_bins = o.N_bins # filter to select models to evaluate
 methods = []
 
 # Add GU
@@ -870,8 +878,7 @@ if o.kde:
     for val_src in val_scenes:
         val_src_name = val_src.replace('/','_')
         print(f'__Validation on {val_src}___________')
-        dataset = ResidualData(dataset_info, val_src, padding=True) # padding the 
-        loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, num_workers=0, shuffle=False)
+        loader = create_loader(val_src)
         eval_results = evaluate(loader, 'kde')
         for M in methods:
             M.best_e += [eval_results[M].best_e]
@@ -1318,7 +1325,7 @@ if o.inliers:
         plt.close(fig)
 # %%
 
-if o.var:
+if o.var or o.largeval:
     print('Variance Test')
     vt_scenes = val_scenes + test_scenes
     res = dict()
@@ -1326,18 +1333,18 @@ if o.var:
     for val_src in vt_scenes:
         val_src_name = val_src.replace('/','_')
         var_file = res_root + val_src + '/val_T.pkl'
-        if os.path.exists(var_file) and True:
+        if os.path.exists(var_file) and not o.recompute: # recompute flag off
             print(f'loading {var_file}')
             eval_results = load_object(var_file)
         else:
             print(f'__Multithreshold on {val_src}___________')
             torch.manual_seed(1)
-            dataset = ResidualData(dataset_info, val_src, padding=True)
-            loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, num_workers=0, shuffle=True)
-            if val_src in val_scenes:
-                pairs_boud = 10000/len(val_scenes)
-            else:
-                pairs_boud = 10000/len(test_scenes)
+            loader = create_loader(val_src)
+            pairs_boud = 20000/len(vt_scenes) # select 20000 from all validation and test scenes, stratified per scene
+            # if val_src in val_scenes:
+            #     pairs_boud = 10000/len(val_scenes) # select 10000 from all validation scenes
+            # else:
+            #     pairs_boud = 10000/len(test_scenes) # and 10000 from all test scenes
             eval_results = evaluate_T(loader, pairs_boud) # dict of results for each scene
             print(f'saving {var_file}')
             force_path(var_file)
@@ -1436,7 +1443,14 @@ if o.var and False:
 #%%
 # %% Expected test error vs training set size
 if o.var:
-    def expected_series(nn, sigmas, adjust_thresholds=False, subsample_MAGSAC=False):
+    def expected_series(nn, sigmas, adjust_thresholds=False, subsample_MAGSAC=False, bootstrap_samples=1000):
+        """
+        nn - list of training set sizes
+        sigmas - list of smoothing sigmas (experimental, =[0] no smoothing)
+        subsample_MAGSAC # make the number of verified temperatures equal for the adjusted range
+        bootstrap_samples = 5000 # how many times to re-draw the validation subset
+        """
+        print(f"Expected test error vs training set size {'adjusted' if adjust_thresholds else ''}")
         # torch.manual_seed(1) # DEBUG
         # np.random.seed(1)
         from scipy.ndimage import gaussian_filter
@@ -1447,16 +1461,21 @@ if o.var:
         eres = {M.name:dotdict() for M in MM}
         for M in MM:
             name = M.name
-            e_val = np.concatenate([res[s][name].best_e for s in val_scenes], axis=0) # [B, T] (i. e. [image pair, threshold])
-            e_test = np.concatenate([res[s][name].best_e for s in test_scenes], axis=0)
+            tv_scenes = val_scenes + test_scenes
+            # e_val = np.concatenate([res[s][name].best_e for s in val_scenes], axis=0) # [B, T] (i. e. [image pair, threshold]) all validation pairs
+            # e_test = np.concatenate([res[s][name].best_e for s in test_scenes], axis=0) # all test pairs
             # sample bootstrap subsets
-            val_samples = 1000 # size of the validation sample
-            # nn = np.array([2,4,8])
-            bootstrap_samples = 1000 # how many times to re-draw the validation subset
-            N = e_val.shape[0]
             ee = []
-            for s in range(bootstrap_samples): #bootstrap samples
+            for s in tqdm(range(bootstrap_samples), desc=f"Bootstrap for method {M.name}"): #bootstrap samples
                 # index = np.random.choice(N, val_samples, replace=False) # choose a validation subset
+                # Leave-one-scene-out cross-validation
+                # pick 2 validation scenes from tv_scenes at random:
+                xval = np.random.choice(tv_scenes,2)
+                xtest = list(set(tv_scenes) - set(xval))
+                e_val = np.concatenate([res[s][name].best_e for s in xval], axis=0)
+                # all the remaning scenes are test
+                e_test = np.concatenate([res[s][name].best_e for s in xtest], axis=0)
+                N = e_val.shape[0]
                 # statistic
                 ne = []
                 if sigmas is None or sigmas == [None]:
@@ -1469,7 +1488,7 @@ if o.var:
                     # range_adjust = False                    
                 for n,sigma in itertools.product(nn, sigmas):
                     # idx = index[:n+1]
-                    idx = np.random.choice(N, n, replace=False) # choose a validation subset
+                    idx = np.random.choice(N, n, replace=True) # choose a validation subset
                     V = np.median(e_val[idx],axis=0) # we use median pose error as the criterion, here median over the selected validation subset
                     nT = len(V)
                     # sigma=2
@@ -1480,11 +1499,11 @@ if o.var:
                             # drop_mask[4:200:3] = 0
                             # V[drop_mask>0] = 100
                             V[tt<0.3] = 1000 # range adjustment
-                            if subsample_MAGSAC:
+                            if subsample_MAGSAC: # make the number of points tried approximatelly equal only evry 3rd is retained
                                 V[5::3] = 1000
                                 V[6::3] = 1000
                         else:
-                            V[tt>10/3] = 1000
+                            V[tt>o.max_distance/3] = 1000
                         # sigma *= 3
                     if sigma > 0:
                         assert(False)
@@ -1532,9 +1551,9 @@ if o.var:
 if o.var and tune_sigma:
     nn = [2]
     sigmas = [0,0.5,1,2,3,4,5,6,7]
-    eres_s = expected_series(nn, sigmas)
-# %%
-if o.var and tune_sigma:
+    eres_s = expected_series(nn, sigmas, bootstrap_samples=5000)
+# %% 
+if o.var and tune_sigma: # Experimental: smooth validation plot before selecting best value
     # smoothing parameter selection
     f = plt.figure(figsize=(8,4))
     names = []
@@ -1563,19 +1582,19 @@ if o.var and tune_sigma:
     plt.close(f)
     [print(M.name, M.best_sigma) for M in MM]
 
-# %%
-if o.var:
-    nn = 2**np.arange(1,11,1)
-    eres = expected_series(nn, [0])
+# %% 
+if o.var: # Statisitcal analyzis of mean and variance of test performance w.r.t. training set size, unajusted
+    nn = 2**np.arange(1,13,1)
+    bootstrap_samples=1000
+    eres = expected_series(nn, [0], bootstrap_samples=bootstrap_samples)
 # %%    
-if o.var:
-    nn = 2**np.arange(1,11,1)
-    eres_smooth = expected_series(nn, [0], adjust_thresholds=True)
-    eres_s2 = expected_series(nn, [0], adjust_thresholds=True, subsample_MAGSAC=True)
+if o.var: # Statisitcal analyzis of mean and variance of test performance w.r.t. training set size, unajusted    
+    eres_adjusted = expected_series(nn, [0], adjust_thresholds=True, bootstrap_samples=bootstrap_samples, subsample_MAGSAC=False)
+    # eres_s2 = expected_series(nn, [0], adjust_thresholds=True, subsample_MAGSAC=True)
     # eres_smooth = expected_series(nn, [0]) # repeatability
 
-# %%
-if o.var:
+# %% 
+if o.var: # plotting E[e] versus training set size
     f = plt.figure(figsize=(8,4))
     names = []
     vv = []
@@ -1592,8 +1611,8 @@ if o.var:
         plt.gca().plot(nn, v, '-', label=name, color = cc[i], marker = markers[i])
         plt.fill_between(nn,y1 = cci[:,0], y2 = cci[:,1], facecolor=cc[i], alpha=0.3, label=None)
         if True:
-            vs = eres_smooth[M.name].expected            
-            cci_s = eres_smooth[M.name].std_ci
+            vs = eres_adjusted[M.name].expected            
+            cci_s = eres_adjusted[M.name].std_ci
             plt.gca().plot(nn, vs, ':', color = cc[i], marker = markers[i], linewidth=2)        
         # if 'MAGSAC' in name:
         #     vs = eres_s2[M.name].expected
@@ -1613,18 +1632,19 @@ if o.var:
     # outf = res_root + f'sensitivity.pdf'
     # savefig(outf)
     # plt.xlim(left=2)
+    plt.grid(axis='y', which='major', linestyle='-', alpha=0.3)
     plt.xscale('log', base=2)
-    plt.xlabel('Validatino set size')
+    plt.xlabel('Validation set size')
     # plt.gca().set_xticklabels(nn)
-    plt.ylabel(r'$\rm\mathbb{E}[e]$')
+    plt.ylabel(r'$\rm\mathbb{E}[e_R]$')
     # plt.title(f'Expected median test pose error vs. validation set size, {dataset_info.name}')
     outf = res_root + f'training_size_e_mean.pdf'
     savefig(outf)
     plt.show()
     plt.close(f)
 
-# %%
-if o.var:
+# %% 
+if o.var: # plotting std[e] versus training set size
     f = plt.figure(figsize=(8,4))
     names = []
     vv = []
@@ -1641,8 +1661,8 @@ if o.var:
         plt.gca().plot(nn, v, '-', label=name, color = cc[i], marker = markers[i])
         plt.fill_between(nn,y1 = cci[:,0], y2 = cci[:,1], facecolor=cc[i], alpha=0.3, label=None)
         if True:
-            v_s = eres_smooth[M.name].std
-            cci_s = eres_smooth[M.name].std_ci
+            v_s = eres_adjusted[M.name].std
+            cci_s = eres_adjusted[M.name].std_ci
             plt.gca().plot(nn, v_s, ':', color = cc[i], marker = markers[i], label=None)
         # plt.fill_between(nn,y1 = cci_s[:,0], y2 = cci_s[:,1], facecolor=cc[i], alpha=0.3, label=None)
         i = i + 1   
@@ -1654,9 +1674,10 @@ if o.var:
     # savefig(outf)
     # plt.xlim(left=2)
     plt.xscale('log', base=2)
-    plt.xlabel('Validatino set size')
+    plt.xlabel('Validation set size')
+    plt.grid(axis='y', which='major', linestyle='-', alpha=0.3)
     # plt.gca().set_xticklabels(nn)
-    plt.ylabel(r'std[e]')
+    plt.ylabel(r'${\rm std}[e_R]$')
     # plt.ylim([0,2])
     plt.yscale('log')
     # plt.title(f'Std of test error with respect to random trining set, smoothed, {dataset_info.name}')
@@ -1666,86 +1687,175 @@ if o.var:
     plt.show()
     plt.close(f)
 
+# %%
+def err_vs_T(scenes = [], val_samples=None, bootstrap_samples = 100):
+    """
+    scenes -- list of scenes
+    val_samples -- number of samples to use for validation plots vs T, default None -- use all samples of the given scenes
+    """
+    print('Measuring Large Set Validation Error vs Temperature')
+    # MM = [M for M in methods if not(isinstance(M, MethodGT) or hasattr(M, 'locked'))]
+    MM = [M for M in methods if M.name in res[scenes[0]].keys()]
+    # MM = [methods[-2]]
+    eres = {M.name:dotdict() for M in MM}
+    for M in MM:
+        name = M.name
+        e_val = np.concatenate([res[s][name].best_e for s in scenes], axis=0) # [B, T] (i. e. [image pair, threshold]) all results for method M
+        if val_samples is None:
+            val_samples = e_val.shape[0]
+        elif val_samples > e_val.shape[0]:
+            raise RuntimeError("Not enough validation samples in the given scenes")
 
-#%%
+        # e_test = np.concatenate([res[s][name].best_e for s in test_scenes], axis=0)
+        N = e_val.shape[0]
+        VV = []
+        Vm = []
+        for s in tqdm(range(bootstrap_samples), desc=f"Bootstrap samples for {name}"): #bootstrap samples
+            idx = np.random.choice(N, val_samples, replace=True) # choose a validation subset                
+            if e_val.ndim ==2:
+                V = np.median(e_val[idx],axis=0) # [T] we use median pose error as the criterion, here median over the selected validation subset
+                Vmin = np.median(np.min(e_val[idx],axis=-1)) # median error of best temperature per image
+            else:
+                V = Vmin = np.median(e_val[idx],axis=0)
+            VV += [V]
+            Vm += [Vmin]
+        # average and std of validation errors over bootstrap samples
+        VV = np.vstack(VV) # [bootstrap_samples, T]
+        Vm = np.vstack(Vm)
+        EV = np.mean(VV, axis=0) # [T]
+        stdV = np.std(VV, axis=0) # [T]
+        if hasattr(M,'hyperparams'):
+            t_best_idx = np.argmin(EV) # select best hyperparameter
+            eres[name].best_t_idx = t_best_idx
+            eres[name].best_t = M.hyperparams[t_best_idx]
+        else:
+            eres[name].best_t_idx = None
+            eres[name].best_t = None
+        eres[name].val_errors_mean = EV
+        eres[name].val_errors_std = stdV
+        eres[name].val_errors_min = np.mean(Vm)
+        eres[name].val_errors_min_std = np.std(Vm)
+    return eres
+    
+# %%
+if o.largeval:
+    # print("Computing validation erorrs vs T")
+    eres_large = err_vs_T(scenes = val_scenes + test_scenes)
+    # eres_large = err_vs_T(scenes = val_scenes, val_samples=2000)
 
-
-
-# %% Format Table
-# res_list = load_object(table_file)
-# df = pd.DataFrame.from_records(data, index=None, exclude=None, columns=None, coerce_float=False, nrows=None)
-# ss = df.to_latex(index=True)
-# ss = ss.replace('±', '$\pm$')
-# f = open(table_out, "w")
-# f.write(ss)
-# f.close()
-
-# # joint results for all test scenes
-# for M in methods:
-#     M.best_e = np.concatenate(M.best_e, axis=0)  # [N T]
-#     M.best_r = np.concatenate(M.best_r, axis=0)  # [N T]
-#     M.best_t = np.concatenate(M.best_t, axis=0)  # [N T]
-
-# if len(results.method) == 0:
-#     for M in methods:
-#         results['method'].append(M.name)
-
-# print('Error stats of method-selected model')
-# stats = [np.median]#np.mean, 
-
-# print("results on pose ")
-
-# for (mi,M) in enumerate(methods):
-#     print(M.name.ljust(maxl), end=': ')
-#     for stat in stats:
-#         try: 
-#             res = scipy.stats.bootstrap((M.best_e,), stat, confidence_level=0.95, method='BCa', n_resamples=10000)
-#         except:
-#             print(np.median(M.best_e))
-#             continue
-#         ci = res.confidence_interval
-#         #d = (ci.high - ci.low)/2
-#         v = stat(M.best_e)
-#         d = max(ci.high-v,v-ci.low)
-#         formatted = format_std(v, d)
-#         print(f'\t {stat.__name__}={formatted}',end='')
-#         if stat == np.median:
-#             # results['method'].append(M.name)
-#             # results[val_src].append(formatted)
-#             if vresults[M.name] is None:
-#                 vresults[M.name] = []
-#             vresults[M.name].append(v)
-#             # results['average'].append(np.array(vresults[M.name]).mean())
-#     print('')
-#     # print(f' std={np.std(M.best_e)}')
-# # %%
-# results['hyperparam'] = []
-# for W in methods:
-#     if isinstance(W, ScoreWeightsMonotoneMix) or isinstance(W, ScoreWeightsMonotoneMix):
-#         hparam = f'$\\pi={W.best_hyperparam*100:3.1f}$%'
-#     elif hasattr(W, 'best_hyperparam'):
-#         hparam = f'$\\tau={W.best_hyperparam:3.2f}$'
-#     else:
-#         hparam = ''
-#     results['hyperparam'].append(hparam)
+#%% 
+if o.largeval:
+    import matplotlib.colors as mcolors
+    cc =  list(mcolors.TABLEAU_COLORS)
+    cc = cc + cc
+    stat = np.median
+    # stat = np.mean
+    # stat = NmAA
+    #
+    for aligned in [False]:
+        fig = plt.figure()
+        ax1 = fig.add_subplot(111)
+        bot = 10        
+        for (i,M) in enumerate(methods):
+            if M.name == 'GT':
+                continue
+            if 'gamma=30.0' in M.name:
+                continue
+            ax = ax1
+            has_hyperparam = hasattr(M, 'set_hyperparam') and not (hasattr(M, 'locked') and M.locked) # chose hyperparam only if has_hyperparam, not locked
+            # if not has_hyperparam:
+                # continue
+            r = eres_large[M.name]
+            v_besti = r.best_t_idx
+            stdV = r.val_errors_std
+            v = r.val_errors_mean
+            t_best = r.best_t
+            style = '-'
+            label=M.name
+            if has_hyperparam:
+                M.set_hyperparam(t_best)
+                M.best_hyperparam = t_best
+                M.hbest_i = v_besti
+                x = M.hyperparams
+                xb = M.best_hyperparam
+                name = M.name + r' ($\tau{=}'+f'{M.best_hyperparam:2.2f}$)'
+                name = name.replace('gamma=30.0', '').replace('gamma=10.0', '')
+                label = name
+                ax.plot(xb, v[v_besti], 'o', label=None, color=cc[i])
+                ax.plot(x, v, style, label=label, color=cc[i])
+                ax.fill_between(x, v - stdV, v + stdV, alpha=0.3, color=cc[i])
+                ax.axhline(r.val_errors_min, color = cc[i], linestyle=":", label=None)
+                ax.fill_between(x, r.val_errors_min - r.val_errors_min_std, r.val_errors_min + r.val_errors_min_std, alpha=0.3, color=cc[i])
+            else: # no hyperparameter to tune: for example GT or Oracle
+                ax.axhline(v, label=label, color = 'k', linestyle=style)
+            bot = min(bot, v[v_besti])
+                
+        plt.legend()
+        ax1.legend(loc=1)
+        # bot = v[v_besti]*0.99 - 0.1
+        # bot = max(0, bot*0.99 - 0.1)
+        if False:
+            bot = 0
+            v_best = np.min(stat(methods[0].best_e.T, axis=-1))
+            top = v_best*1.5 + 1.0
+            if stat == NmAA:
+                bot = v[v_besti]*0.99
+                top = min(1.0, v_best*1.2)
+            if not aligned:
+                plt.ylim([bot, top])
+                pass
+            else:
+                plt.ylim([bot, top])
+                pass
+                # plt.ylim([1.8, 1.8 + 2.2 - 1.5])
+                plt.xlim([0,3])
+        ax1.set_xlabel('Hyperparameter $\\tau$ [px]')
+        ax1.locator_params(axis='x', nbins=10)
+        plt.gca().yaxis.set_minor_locator(matplotlib.ticker.AutoMinorLocator())            
+        ax1.locator_params(axis='y', nbins=10)
+        ax1.set_ylabel(f'{stat.__name__} R error')
+        plt.draw()
+        # Path('fig').mkdir(exist_ok=True)
+        fig_path = results_path + f'/fig/'
+        # force_path(fig_path)
+        savefig(fig_path + f'validation.pdf')
+        plt.show()
+        plt.close(fig)
 
 # %%
-if False: # create latex table
-    df = pd.DataFrame.from_dict(results)
-    mnames = [m.name for m in methods]
-    df['method'] = pd.Categorical(df['method'], mnames)
-
-    # display(df)
-    ss = df.to_latex(index=True)
-    print(ss.replace('±', '$\pm$'))
-
 # %%
-# f = plt.figure()
-# for M in methods[0:5]:
-#     y, bine = np.histogram(M.best_e, 20, range=(0,50), density=True)
-#     plt.plot(bine[:-1], y, label=M.name)
-#     # plt.hist(M.best_e)
-# plt.legend()
-# plt.show()
-# plt.close(f)
+if o.largeval:
+    print('Plotting validation kernels')
+    plt.figure()
+    for (i,W) in enumerate(methods):
+        if hasattr(W, 'locked'):
+            continue
+        if 'gamma=30.0' in W.name:
+                continue
+        # if 'ML' in W.name and 'mult' in W.name:
+            # continue
+        # w = W.score_weights_normalized()
+        w = W.M[W.hbest_i]
+        W.val_w = w
+        pow = 1
+        xx = (torch.arange(w.shape[0])/w.shape[0]*W.max_distance**pow)**(1/pow)
+        # if isinstance(W, ScoreWeightsMonotoneMix): # or isinstance(W, ScoreWeightsTZ):
+            # hparam = f'$\\gamma={W.best_hyperparam*100:3.1f}$%'
+        # else:
+        # hparam = f'$\\tau={W.best_hyperparam:3.2f}$'
+        name = W.name + f'($\\tau={W.best_hyperparam:2.2f}$)'   
+        name = name.replace('gamma=30.0','').replace('gamma=10.0','')
+        plt.plot(xx, w.cpu().detach(), label=name, color = cc[i], marker = markers[i], markevery = [35+i*20])
+    plt.legend()
+    # plt.title('Selected kernels')
+    plt.xlim(0,10)
+    plt.xlabel('Residual [px]')
+    plt.show()
+    plt.draw()
+    force_path(fig_path)
+    savefig(fig_path + f'validation_kernels.pdf')
+
+    force_path(val_file)
+    save_object(val_file, methods)
+    
 # %%
