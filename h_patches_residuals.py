@@ -32,6 +32,8 @@ except Exception:
     has_scipy_stats = False
 
 from .model_H import SampsonBM
+from .model_E import SampsonBM as SampsonBM_E
+from .drawing import savefig
 
 # ========== USER PARAMETERS ==========
 ROOT = "data/hpatches-sequences-release"                 # set path here (string), or leave None to be prompted
@@ -129,7 +131,7 @@ def nearest_neighbors(pts_query, pts_db):
         dists = np.sqrt(d2[np.arange(d2.shape[0]), idxs])
         return idxs, dists
 
-def match_descriptors_ratio_test(desc1, desc2, pts1, pts2, H, ratio_threshold=DESCRIPTOR_RATIO_THRESHOLD, reproj_barrier_threshold=REPROJECTION_BARRIER_THRESHOLD):
+def match_descriptors_ratio_test(desc1, desc2, pts1, pts2, H):
     """Match descriptors using Lowe's ratio test with geometric barrier (GPU-accelerated).
     Returns indices of matches in desc1 and desc2.
     
@@ -316,10 +318,11 @@ def compute_residuals(root, recompute=False, summary=False):
         try:
             cache = np.load(out_npz)
             all_sampson_sq = np.array(cache["sampson_sq"]).copy()
+            all_sampson_E_sq = np.array(cache.get("sampson_E_sq", [])).copy()
             all_descriptor_distances = np.array(cache.get("descriptor_distances", [])).copy()
             if VERBOSE:
                 print(f"Loaded cached results from {out_npz}")
-            return all_sampson_sq, all_descriptor_distances, None
+            return all_sampson_sq, all_sampson_E_sq, all_descriptor_distances, None
         except Exception as e:
             print("Failed to load cached results, recomputing:", e)
             all_sampson_sq = None
@@ -332,6 +335,7 @@ def compute_residuals(root, recompute=False, summary=False):
         seq_dirs = [s for s in seq_dirs if not s.startswith('v_')]
     
     sampson_sq_list = []
+    sampson_E_sq_list = []
     descriptor_distances_list = []
     processed_pairs = 0
     seq_summaries = [] if summary else None
@@ -472,6 +476,70 @@ def compute_residuals(root, recompute=False, summary=False):
             sampson_sq = sampson_res_np ** 2
             # Ensure we have an iterable even for single values
             sampson_sq_list.extend(np.atleast_1d(sampson_sq).tolist())
+            
+            # Compute fundamental matrix from homography using synthetic points
+            try:
+                # Generate synthetic point correspondences using the homography
+                # Use 8 points in a grid pattern to avoid degeneracies
+                img_h, img_w = images[idx_a].shape[:2]
+                
+                # Create grid of points covering the image
+                grid_x = np.linspace(img_w * 0.1, img_w * 0.9, 3)
+                grid_y = np.linspace(img_h * 0.1, img_h * 0.9, 3)
+                synth_pts1 = np.array([[x, y] for y in grid_y for x in grid_x], dtype=np.float64)
+                
+                # Warp through homography to get corresponding points
+                synth_pts1_h = np.hstack([synth_pts1, np.ones((synth_pts1.shape[0], 1))])
+                synth_pts2_h = (H @ synth_pts1_h.T).T
+                synth_pts2 = synth_pts2_h[:, :2] / synth_pts2_h[:, 2:3]
+                
+                # Compute fundamental matrix using 8-point algorithm
+                # Normalize coordinates for numerical stability
+                mean1 = np.mean(synth_pts1, axis=0)
+                mean2 = np.mean(synth_pts2, axis=0)
+                scale1 = np.sqrt(2) / np.mean(np.linalg.norm(synth_pts1 - mean1, axis=1))
+                scale2 = np.sqrt(2) / np.mean(np.linalg.norm(synth_pts2 - mean2, axis=1))
+                
+                T1 = np.array([[scale1, 0, -scale1*mean1[0]],
+                              [0, scale1, -scale1*mean1[1]],
+                              [0, 0, 1]], dtype=np.float64)
+                T2 = np.array([[scale2, 0, -scale2*mean2[0]],
+                              [0, scale2, -scale2*mean2[1]],
+                              [0, 0, 1]], dtype=np.float64)
+                
+                pts1_norm = (T1 @ synth_pts1_h.T).T
+                pts2_norm = (T2 @ np.hstack([synth_pts2, np.ones((synth_pts2.shape[0], 1))]).T).T
+                
+                # Build constraint matrix for F
+                A = np.zeros((synth_pts1.shape[0], 9), dtype=np.float64)
+                for i in range(synth_pts1.shape[0]):
+                    x1, y1, _ = pts1_norm[i]
+                    x2, y2, _ = pts2_norm[i]
+                    A[i] = [x2*x1, x2*y1, x2, y2*x1, y2*y1, y2, x1, y1, 1]
+                
+                # Solve for F using SVD
+                _, _, Vt = np.linalg.svd(A)
+                F_norm = Vt[-1].reshape(3, 3)
+                
+                # Enforce rank-2 constraint
+                U, S, Vt = np.linalg.svd(F_norm)
+                S[2] = 0
+                F_norm = U @ np.diag(S) @ Vt
+                
+                # Denormalize
+                F = T2.T @ F_norm @ T1
+                
+                # Compute Sampson_E residuals using F (same as essential matrix residuals)
+                F_t = torch.from_numpy(F).double().unsqueeze(0).unsqueeze(0)  # [1,1,3,3]
+                
+                sampson_E_res = SampsonBM_E(y_t, x_t, F_t)  # [1,1,n]
+                sampson_E_res_np = sampson_E_res.squeeze().cpu().numpy()  # [n]
+                sampson_E_sq = sampson_E_res_np ** 2
+                sampson_E_sq_list.extend(np.atleast_1d(sampson_E_sq).tolist())
+            except Exception as e:
+                # If F computation fails, skip E residuals for this pair
+                pass
+            
             processed_pairs += 1
             
             if summary:
@@ -491,17 +559,18 @@ def compute_residuals(root, recompute=False, summary=False):
 
     if len(sampson_sq_list) == 0:
         print("No matches found. Try increasing MAX_KEYPOINTS or NN_DIST_THRESHOLD.")
-        return None, None, None
+        return None, None, None, None
 
     all_sampson_sq = np.array(sampson_sq_list)
+    all_sampson_E_sq = np.array(sampson_E_sq_list) if len(sampson_E_sq_list) > 0 else np.array([])
     all_descriptor_distances = np.array(descriptor_distances_list) if len(descriptor_distances_list) > 0 else np.array([])
 
     # Save cache
-    np.savez_compressed(out_npz, sampson_sq=all_sampson_sq, descriptor_distances=all_descriptor_distances)
+    np.savez_compressed(out_npz, sampson_sq=all_sampson_sq, sampson_E_sq=all_sampson_E_sq, descriptor_distances=all_descriptor_distances)
     if VERBOSE:
         print("Saved results to", out_npz)
     
-    return all_sampson_sq, all_descriptor_distances, seq_summaries
+    return all_sampson_sq, all_sampson_E_sq, all_descriptor_distances, seq_summaries
 
 def plot_descriptor_distances(descriptor_distances):
     """Plot histogram of SIFT descriptor distances for matched inliers."""
@@ -532,24 +601,45 @@ def plot_descriptor_distances(descriptor_distances):
         "p99": float(np.percentile(descriptor_distances, 99)),
     })
 
-def plot_sampson_histogram(sampson_residuals, hist_range=HIST_RANGE, hist_bins=HIST_BINS, n_components=NUM_MIXTURE_COMPONENTS):
-    """Plot histogram of Sampson residuals with mixture of chi(2) distributions.
+def plot_sampson_histogram(sampson_residuals, kind='H', hist_range=HIST_RANGE, hist_bins=HIST_BINS, n_components=NUM_MIXTURE_COMPONENTS):
+    """Plot histogram of Sampson residuals with mixture of chi distributions.
     
     Args:
         sampson_residuals: Array of Sampson residual values
+        kind: 'H' for homography (chi(2)) or 'F' for fundamental/essential matrix (chi(1))
         hist_range: Range for histogram plot
         hist_bins: Number of histogram bins
-        n_components: Number of chi(2) components in mixture
+        n_components: Number of chi components in mixture
     """
     if sampson_residuals.size == 0:
         print("WARNING: No residuals to plot.")
         return
     
-    plt.figure(figsize=(8, 4))
+    # Set parameters based on kind
+    if kind == 'H':
+        df = 2  # degrees of freedom for homography
+        initial_scale_min = 0.25
+        initial_scale_max = 1.0
+        scale_bound_min = 0.01
+        scale_bound_max = 10.0
+        title = "Homography Residuals"
+    elif kind == 'F':
+        df = 1  # degrees of freedom for fundamental/essential matrix
+        initial_scale_min = 0.15
+        initial_scale_max = 0.8
+        scale_bound_min = 0.01
+        scale_bound_max = 5.0
+        title = "Epipolar Residuals"
+    else:
+        raise ValueError(f"Unknown kind: {kind}. Must be 'H' or 'F'.")
+
+    label = 'Histogram of inlier residuals'
+
+    fig = plt.figure(figsize=(6, 3.5))
     counts, bins, _ = plt.hist(sampson_residuals, bins=hist_bins, range=hist_range, 
-                                density=True, alpha=0.7, label='Sampson residuals', color='gray')
+                                density=True, alpha=0.7, label=label, color='gray')
     
-    # Fit mixture of n_components chi(2) distributions with different scales
+    # Fit mixture of n_components chi distributions with different scales
     if has_scipy_stats and sampson_residuals.size > 0:
         from scipy.optimize import minimize
         
@@ -568,12 +658,12 @@ def plot_sampson_histogram(sampson_residuals, hist_range=HIST_RANGE, hist_bins=H
             weights = softmax(logits)
             
             # Keep scales positive and reasonable
-            scales = np.clip(scales, 0.01, 10.0)
+            scales = np.clip(scales, scale_bound_min, scale_bound_max)
             
             # Compute mixture PDF
             mixture_pdf = np.zeros_like(sampson_residuals)
             for i in range(n_components):
-                chi_pdf = chi.pdf(sampson_residuals, 2, loc=0, scale=scales[i])
+                chi_pdf = chi.pdf(sampson_residuals, df, loc=0, scale=scales[i])
                 mixture_pdf += weights[i] * chi_pdf
             
             mixture_pdf = np.clip(mixture_pdf, 1e-10, None)  # Avoid log(0)
@@ -582,13 +672,16 @@ def plot_sampson_histogram(sampson_residuals, hist_range=HIST_RANGE, hist_bins=H
         
         # Initial guess: uniform logits -> equal weights, exponentially spaced scales
         initial_logits = np.zeros(n_components)
-        initial_scales = np.logspace(np.log10(0.25), np.log10(1.0), n_components)
+        initial_scales = np.logspace(np.log10(initial_scale_min), np.log10(initial_scale_max), n_components)
         initial_params = np.concatenate([initial_logits, initial_scales])
         
         # Bounds: logits unconstrained, scales positive
-        # bounds = [(-10, 10)] * n_components + [(0.01, 10.0)] * n_components
-        bounds = [(-10, 10)] * n_components + [(s*0.9,s*1.1) for s in initial_scales]  # Fix scales to initial for stability
-        
+        if kind == 'H':
+            # For homography, fix scales near initial for stability
+            bounds = [(-10, 10)] * n_components + [(s*0.9, s*1.1) for s in initial_scales]
+        else:
+            # For fundamental matrix, allow wider scale range
+            bounds = [(-10, 10)] * n_components + [(scale_bound_min, scale_bound_max)] * n_components
         
         result = minimize(negative_log_likelihood, initial_params, method='L-BFGS-B', bounds=bounds)
         
@@ -599,9 +692,9 @@ def plot_sampson_histogram(sampson_residuals, hist_range=HIST_RANGE, hist_bins=H
             # Convert logits to weights via softmax
             weights_fit = softmax(logits_fit)
             
-            print(f"Fitted {n_components}-component mixture:")
+            print(f"Fitted {n_components}-component Chi({df}) mixture ({kind}-residuals):")
             for i in range(n_components):
-                print(f"  Component {i+1}: weight={weights_fit[i]:.4f}, Chi(2, σ={scales_fit[i]:.4f})")
+                print(f"  Component {i+1}: weight={weights_fit[i]:.4f}, Chi({df}, σ={scales_fit[i]:.4f})")
             
             # Generate fitted curves
             x = np.linspace(hist_range[0], hist_range[1], 1000)
@@ -611,26 +704,105 @@ def plot_sampson_histogram(sampson_residuals, hist_range=HIST_RANGE, hist_bins=H
             
             # Plot individual components
             for i in range(n_components):
-                chi_pdf = chi.pdf(x, 2, loc=0, scale=scales_fit[i])
+                chi_pdf = chi.pdf(x, df, loc=0, scale=scales_fit[i])
                 mixture_pdf += weights_fit[i] * chi_pdf
                 color = colors[i % len(colors)]
+                # plt.plot(x, weights_fit[i] * chi_pdf, '--', linewidth=1, alpha=0.5, color=color,
+                #         label=f'C{i+1}: {weights_fit[i]:.2f}×Chi({df}, σ={scales_fit[i]:.2f})')
                 plt.plot(x, weights_fit[i] * chi_pdf, '--', linewidth=1, alpha=0.5, color=color,
-                        label=f'C{i+1}: {weights_fit[i]:.2f}×Chi(2, σ={scales_fit[i]:.2f})')
+                        label=None)
             
             # Plot mixture
-            plt.plot(x, mixture_pdf, 'r-', linewidth=2, label=f'Mixture ({n_components} components)')
+            plt.plot(x, mixture_pdf, 'r-', linewidth=2, label=f'Mixture of $\chi_{{{df}}}$ distributions')
         else:
             print("Mixture fitting failed:", result.message)
     
-    plt.title("Histogram of Sampson residuals (pixels)")
-    plt.xlabel("Sampson residual (px)")
+    plt.xlim(left=0)
+    plt.title(title)
+    plt.xlabel("Sampson Error [px]")
     plt.ylabel("Density")
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
+    plt.draw()
+    outf = f'fig/dist_{kind}.pdf'
+    savefig(outf)
+    plt.show()
+    plt.close(fig)
     plt.show()
 
 def main():
+    # Load the cached descriptor distance histogram from PhotoTourism data
+    import pickle
+    descriptor_hist_file = "/mnt/datagrid/personal/shekhovt/datagrid/data/PhotoTourism/sampson_error_histogram.pkl"
+    
+    if os.path.isfile(descriptor_hist_file):
+        print(f"Loading descriptor distances from {descriptor_hist_file}")
+        with open(descriptor_hist_file, 'rb') as f:
+            data = pickle.load(f)
+        
+        # Check if data is histogram format (hist, bin_edges)
+        if isinstance(data, dict) and 'hist' in data and 'bin_edges' in data:
+            hist = np.array(data['hist'])
+            bin_edges = np.array(data['bin_edges'])
+            
+            # Reconstruct samples from histogram by sampling from bin centers
+            # weighted by histogram counts
+            bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+            
+            # Create samples: repeat each bin center according to its count
+            descriptor_distances = np.repeat(bin_centers, hist.astype(int))
+            
+            print(f"Reconstructed {len(descriptor_distances)} samples from histogram")
+            print(f"Histogram has {len(hist)} bins, range [{bin_edges[0]:.3f}, {bin_edges[-1]:.3f}]")
+            print("Descriptor distance stats:", {
+                "min": float(np.min(descriptor_distances)),
+                "mean": float(np.mean(descriptor_distances)),
+                "median": float(np.median(descriptor_distances)),
+                "max": float(np.max(descriptor_distances)),
+                "std": float(np.std(descriptor_distances)),
+                "p90": float(np.percentile(descriptor_distances, 90)),
+                "p99": float(np.percentile(descriptor_distances, 99)),
+            })
+            
+            # Determine appropriate histogram range from the data
+            hist_max = min(float(bin_edges[-1]), float(np.percentile(descriptor_distances, 99.5)))
+            
+            # Plot as epipolar residuals using our plotting function
+            plot_sampson_histogram(descriptor_distances, kind='F', hist_range=(0.0, hist_max), hist_bins=100, n_components=3)
+        else:
+            # Try to extract raw data
+            if isinstance(data, dict):
+                descriptor_distances = data.get('descriptor_distances') or data.get('residuals') or data.get('sampson_residuals')
+            else:
+                descriptor_distances = data
+            
+            if descriptor_distances is not None and len(descriptor_distances) > 0:
+                descriptor_distances = np.array(descriptor_distances)
+                print(f"Loaded {len(descriptor_distances)} descriptor distance values")
+                print("Descriptor distance stats:", {
+                    "min": float(np.min(descriptor_distances)),
+                    "mean": float(np.mean(descriptor_distances)),
+                    "median": float(np.median(descriptor_distances)),
+                    "max": float(np.max(descriptor_distances)),
+                    "std": float(np.std(descriptor_distances)),
+                    "p90": float(np.percentile(descriptor_distances, 90)),
+                    "p99": float(np.percentile(descriptor_distances, 99)),
+                })
+                
+                # Plot as epipolar residuals using our plotting function
+                plot_sampson_histogram(descriptor_distances, kind='F', hist_range=(0.0, 3.0), hist_bins=100, n_components=3)
+            else:
+                print("ERROR: Could not extract descriptor distances from loaded data")
+                print("Data structure:", type(data))
+                if isinstance(data, dict):
+                    print("Available keys:", data.keys())
+        return
+    
+    # If file doesn't exist, fall back to original behavior
+    print(f"File not found: {descriptor_hist_file}")
+    print("Computing residuals from HPatches dataset instead...")
+    
     # Resolve dataset root
     root = input_root()
     if not os.path.isdir(root):
@@ -638,7 +810,7 @@ def main():
         return
 
     # Compute or load residuals
-    all_sampson_sq, all_descriptor_distances, seq_summaries = compute_residuals(
+    all_sampson_sq, all_sampson_E_sq, all_descriptor_distances, seq_summaries = compute_residuals(
         root, recompute=RECOMPUTE_RES, summary=SUMMARY
     )
     
@@ -658,7 +830,22 @@ def main():
     })
 
     # Plot histogram with chi distribution fit
-    plot_sampson_histogram(sampson_residuals)
+    plot_sampson_histogram(sampson_residuals, kind='H')
+    
+    # Plot Sampson_E residuals if available
+    print(all_sampson_E_sq)
+    if all_sampson_E_sq is not None and all_sampson_E_sq.size > 0:
+        sampson_E_residuals = np.sqrt(np.maximum(all_sampson_E_sq, 0.0))
+        print("\nSampson_E residuals (from fundamental matrix):")
+        print("Total correspondences with valid E:", int(all_sampson_E_sq.size))
+        print("Sampson_E residuals summary:", {
+            "min": float(np.min(sampson_E_residuals)),
+            "median": float(np.median(sampson_E_residuals)),
+            "max": float(np.max(sampson_E_residuals)),
+        })
+        plot_sampson_histogram(sampson_E_residuals, kind='F')
+    else:
+        print("\nNo Sampson_E residuals available (fundamental matrix computation may have failed)")
     
     # Plot descriptor distances histogram
     if all_descriptor_distances is not None and all_descriptor_distances.size > 0:

@@ -242,3 +242,8 @@ def pose_error_batch_torch(models, data):
     err_t = torch.min(t_error(T, gt_T), t_error(-T, gt_T))
     err_e = torch.max(err_R, err_t)
     return err_e, err_R, err_t
+
+
+def compose_essential_matrix(R, t):
+    Tx = kornia.geometry.epipolar.cross_product_matrix(t)
+    return Tx @ R
