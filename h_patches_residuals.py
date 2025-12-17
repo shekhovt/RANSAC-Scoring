@@ -572,7 +572,7 @@ def compute_residuals(root, recompute=False, summary=False):
     
     return all_sampson_sq, all_sampson_E_sq, all_descriptor_distances, seq_summaries
 
-def plot_descriptor_distances(descriptor_distances):
+def plot_descriptor_distances(descriptor_distances, dataset_name=''):
     """Plot histogram of SIFT descriptor distances for matched inliers."""
     if descriptor_distances.size == 0:
         print("WARNING: No descriptor distances to plot.")
@@ -581,7 +581,8 @@ def plot_descriptor_distances(descriptor_distances):
     plt.figure(figsize=(8, 4))
     plt.hist(descriptor_distances, bins=100, range=(0, 1000), density=True, alpha=0.7, label='Descriptor L2 distances')
     
-    plt.title("Histogram of SIFT Descriptor Distances (Matched Inliers)")
+    title_prefix = f"{dataset_name} - " if dataset_name else ""
+    plt.title(f"{title_prefix}Histogram of SIFT Descriptor Distances (Matched Inliers)")
     plt.xlabel("L2 Distance")
     plt.ylabel("Density")
     plt.legend()
@@ -601,7 +602,7 @@ def plot_descriptor_distances(descriptor_distances):
         "p99": float(np.percentile(descriptor_distances, 99)),
     })
 
-def plot_sampson_histogram(sampson_residuals, kind='H', hist_range=HIST_RANGE, hist_bins=HIST_BINS, n_components=NUM_MIXTURE_COMPONENTS):
+def plot_sampson_histogram(sampson_residuals, kind='H', hist_range=HIST_RANGE, hist_bins=HIST_BINS, n_components=NUM_MIXTURE_COMPONENTS, dataset_name=''):
     """Plot histogram of Sampson residuals with mixture of chi distributions.
     
     Args:
@@ -610,6 +611,7 @@ def plot_sampson_histogram(sampson_residuals, kind='H', hist_range=HIST_RANGE, h
         hist_range: Range for histogram plot
         hist_bins: Number of histogram bins
         n_components: Number of chi components in mixture
+        dataset_name: Name of dataset for filename prefix
     """
     if sampson_residuals.size == 0:
         print("WARNING: No residuals to plot.")
@@ -678,7 +680,7 @@ def plot_sampson_histogram(sampson_residuals, kind='H', hist_range=HIST_RANGE, h
         # Bounds: logits unconstrained, scales positive
         if kind == 'H':
             # For homography, fix scales near initial for stability
-            bounds = [(-10, 10)] * n_components + [(s*0.9, s*1.1) for s in initial_scales]
+            bounds = [(-10, 10)] * n_components + [(s*0.9, s*1.5) for s in initial_scales]
         else:
             # For fundamental matrix, allow wider scale range
             bounds = [(-10, 10)] * n_components + [(scale_bound_min, scale_bound_max)] * n_components
@@ -717,44 +719,78 @@ def plot_sampson_histogram(sampson_residuals, kind='H', hist_range=HIST_RANGE, h
         else:
             print("Mixture fitting failed:", result.message)
     
-    plt.xlim(left=0)
-    plt.title(title)
+    plt.xlim(left=0, right = 3.0)
+    title_prefix = f"{dataset_name} - " if dataset_name else ""
+    plt.title(f"{title_prefix}{title}")
     plt.xlabel("Sampson Error [px]")
     plt.ylabel("Density")
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
     plt.draw()
-    outf = f'fig/dist_{kind}.pdf'
+    filename_prefix = f"{dataset_name}_" if dataset_name else ""
+    outf = f'fig/{filename_prefix}dist_{kind}.pdf'
     savefig(outf)
     plt.show()
     plt.close(fig)
     plt.show()
 
-def main():
-    # Load the cached descriptor distance histogram from PhotoTourism data
+def process_phototourism_data(descriptor_hist_file):
+    """Load and process PhotoTourism descriptor distance histogram."""
     import pickle
-    descriptor_hist_file = "/mnt/datagrid/personal/shekhovt/datagrid/data/PhotoTourism/sampson_error_histogram.pkl"
     
-    if os.path.isfile(descriptor_hist_file):
-        print(f"Loading descriptor distances from {descriptor_hist_file}")
-        with open(descriptor_hist_file, 'rb') as f:
-            data = pickle.load(f)
+    if not os.path.isfile(descriptor_hist_file):
+        print(f"File not found: {descriptor_hist_file}")
+        return False
+    
+    print(f"Loading descriptor distances from {descriptor_hist_file}")
+    with open(descriptor_hist_file, 'rb') as f:
+        data = pickle.load(f)
+    
+    # Check if data is histogram format (hist, bin_edges)
+    if isinstance(data, dict) and 'hist' in data and 'bin_edges' in data:
+        hist = np.array(data['hist'])
+        bin_edges = np.array(data['bin_edges'])
         
-        # Check if data is histogram format (hist, bin_edges)
-        if isinstance(data, dict) and 'hist' in data and 'bin_edges' in data:
-            hist = np.array(data['hist'])
-            bin_edges = np.array(data['bin_edges'])
-            
-            # Reconstruct samples from histogram by sampling from bin centers
-            # weighted by histogram counts
-            bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-            
-            # Create samples: repeat each bin center according to its count
-            descriptor_distances = np.repeat(bin_centers, hist.astype(int))
-            
-            print(f"Reconstructed {len(descriptor_distances)} samples from histogram")
-            print(f"Histogram has {len(hist)} bins, range [{bin_edges[0]:.3f}, {bin_edges[-1]:.3f}]")
+        # Reconstruct samples deterministically from normalized histogram
+        # Create int(hist[i] * 10000) copies of each bin center
+        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+        
+        # Determine number of samples per bin proportional to density
+        target_total = 10000
+        samples_per_bin = (hist * target_total).astype(int)
+        
+        # Create samples by repeating each bin center
+        descriptor_distances = np.repeat(bin_centers, samples_per_bin)
+        
+        print(f"Reconstructed {len(descriptor_distances)} samples from normalized histogram")
+        print(f"Histogram has {len(hist)} bins, range [{bin_edges[0]:.3f}, {bin_edges[-1]:.3f}]")
+        print("Descriptor distance stats:", {
+            "min": float(np.min(descriptor_distances)),
+            "mean": float(np.mean(descriptor_distances)),
+            "median": float(np.median(descriptor_distances)),
+            "max": float(np.max(descriptor_distances)),
+            "std": float(np.std(descriptor_distances)),
+            "p90": float(np.percentile(descriptor_distances, 90)),
+            "p99": float(np.percentile(descriptor_distances, 99)),
+        })
+        
+        # Use exact same range and number of bins as the original histogram
+        hist_range = (float(bin_edges[0]), float(bin_edges[-1]))
+        hist_bins = len(hist)
+        
+        # Plot as epipolar residuals using our plotting function
+        plot_sampson_histogram(descriptor_distances, kind='F', hist_range=hist_range, hist_bins=hist_bins, n_components=3, dataset_name='PhotoTourism')
+    else:
+        # Try to extract raw data
+        if isinstance(data, dict):
+            descriptor_distances = data.get('descriptor_distances') or data.get('residuals') or data.get('sampson_residuals')
+        else:
+            descriptor_distances = data
+        
+        if descriptor_distances is not None and len(descriptor_distances) > 0:
+            descriptor_distances = np.array(descriptor_distances)
+            print(f"Loaded {len(descriptor_distances)} descriptor distance values")
             print("Descriptor distance stats:", {
                 "min": float(np.min(descriptor_distances)),
                 "mean": float(np.mean(descriptor_distances)),
@@ -765,43 +801,26 @@ def main():
                 "p99": float(np.percentile(descriptor_distances, 99)),
             })
             
-            # Determine appropriate histogram range from the data
-            hist_max = min(float(bin_edges[-1]), float(np.percentile(descriptor_distances, 99.5)))
-            
             # Plot as epipolar residuals using our plotting function
-            plot_sampson_histogram(descriptor_distances, kind='F', hist_range=(0.0, hist_max), hist_bins=100, n_components=3)
+            plot_sampson_histogram(descriptor_distances, kind='F', hist_range=(0.0, 3.0), hist_bins=100, n_components=3, dataset_name='PhotoTourism')
         else:
-            # Try to extract raw data
+            print("ERROR: Could not extract descriptor distances from loaded data")
+            print("Data structure:", type(data))
             if isinstance(data, dict):
-                descriptor_distances = data.get('descriptor_distances') or data.get('residuals') or data.get('sampson_residuals')
-            else:
-                descriptor_distances = data
-            
-            if descriptor_distances is not None and len(descriptor_distances) > 0:
-                descriptor_distances = np.array(descriptor_distances)
-                print(f"Loaded {len(descriptor_distances)} descriptor distance values")
-                print("Descriptor distance stats:", {
-                    "min": float(np.min(descriptor_distances)),
-                    "mean": float(np.mean(descriptor_distances)),
-                    "median": float(np.median(descriptor_distances)),
-                    "max": float(np.max(descriptor_distances)),
-                    "std": float(np.std(descriptor_distances)),
-                    "p90": float(np.percentile(descriptor_distances, 90)),
-                    "p99": float(np.percentile(descriptor_distances, 99)),
-                })
-                
-                # Plot as epipolar residuals using our plotting function
-                plot_sampson_histogram(descriptor_distances, kind='F', hist_range=(0.0, 3.0), hist_bins=100, n_components=3)
-            else:
-                print("ERROR: Could not extract descriptor distances from loaded data")
-                print("Data structure:", type(data))
-                if isinstance(data, dict):
-                    print("Available keys:", data.keys())
-        return
+                print("Available keys:", data.keys())
+            return False
     
-    # If file doesn't exist, fall back to original behavior
-    print(f"File not found: {descriptor_hist_file}")
-    print("Computing residuals from HPatches dataset instead...")
+    return True
+
+def main():
+    # Process PhotoTourism data
+    descriptor_hist_file = "/mnt/datagrid/personal/shekhovt/datagrid/data/PhotoTourism/sampson_error_histogram.pkl"
+    process_phototourism_data(descriptor_hist_file)
+    
+    # Process HPatches dataset
+    print("\n" + "="*80)
+    print("Processing HPatches dataset...")
+    print("="*80 + "\n")
     
     # Resolve dataset root
     root = input_root()
@@ -830,7 +849,7 @@ def main():
     })
 
     # Plot histogram with chi distribution fit
-    plot_sampson_histogram(sampson_residuals, kind='H')
+    plot_sampson_histogram(sampson_residuals, kind='H', dataset_name='HPatches')
     
     # Plot Sampson_E residuals if available
     print(all_sampson_E_sq)
@@ -843,13 +862,13 @@ def main():
             "median": float(np.median(sampson_E_residuals)),
             "max": float(np.max(sampson_E_residuals)),
         })
-        plot_sampson_histogram(sampson_E_residuals, kind='F')
+        plot_sampson_histogram(sampson_E_residuals, kind='F', dataset_name='HPatches')
     else:
         print("\nNo Sampson_E residuals available (fundamental matrix computation may have failed)")
     
     # Plot descriptor distances histogram
     if all_descriptor_distances is not None and all_descriptor_distances.size > 0:
-        plot_descriptor_distances(all_descriptor_distances)
+        plot_descriptor_distances(all_descriptor_distances, dataset_name='HPatches')
     else:
         print("No descriptor distances available (USE_DESCRIPTORS may be False)")
 
