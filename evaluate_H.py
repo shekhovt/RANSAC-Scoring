@@ -38,6 +38,7 @@ from . import local_optimization as LO
 from .drawing import *
 
 from . import model_H
+from .model import AUC_10
 
 op = ArgumentParser()
 op.add_argument("--batch_size", type=int, default=8, help="number of pairs processed in parallel")
@@ -51,13 +52,13 @@ op.add_argument("--data", type=str, default='HEB', help="dataset")
 op.add_argument("-V", "--validate", action='store_true', default=False, help="recompute validation")
 op.add_argument("-R", "--recompute", action='store_true', default=False, help="recompute test")
 op.add_argument("--running", action='store_true', default=False, help="running test")
+op.add_argument("--var", action='store_true', default=False, help="variance test")
+op.add_argument("--largeval", action='store_true', default=False, help="variance test")
+# Experimental / depricated
 op.add_argument("--kde", action='store_true', default=False, help="?")
 op.add_argument("--geom", action='store_true', default=False, help="error geometry analysis")
 op.add_argument("--inliers", action='store_true', default=False, help="inliers statistics experiment")
-op.add_argument("--static", action='store_true', default=False, help="static 1K test, DEPRICATED")
-# op.add_argument("--var", type=bool, default=False, help="variance test")
-op.add_argument("--var", action='store_true', default=False, help="variance test")
-op.add_argument("--largeval", action='store_true', default=False, help="variance test")
+op.add_argument("--static", action='store_true', default=False, help="static 1K test, DEPRICATED") # DEPRICATED
 op.add_argument("--F", action='store_true', default=False, help="use solver for F matrix (regardless of the dataset)")
 # DEPRICATED
 # op.add_argument("--new_models", type=bool, default=True, help="sample new models, cannot be changed")
@@ -108,14 +109,14 @@ if dataset_info.name != o.data:
 o.type = dataset_info.type
 
 if dataset_info.type == 'H':
-    from .model_H import new_minimal_models, pose_error_batch_torch, AUC_10, compute_residuals
+    from .model_H import new_minimal_models, pose_error_batch_torch, compute_residuals
     o.minimal_sample = 4
     o.avg_solutions = 1
     o.min_solver = model_H.solve_homography
-    o.MAGSAC_dof = 2
+    o.MAGSAC_dof = 4
 
 else:
-    from .model_E import new_minimal_models, pose_error_batch_torch, AUC_10, compute_residuals
+    from .model_E import new_minimal_models, pose_error_batch_torch, compute_residuals
     o.minimal_sample = 5
     o.avg_solutions = 1
     o.MAGSAC_dof = 4
@@ -192,11 +193,12 @@ def evaluate(loader, mode):
         eval_results[m].best_r = []
         eval_results[m].best_t = []
 
-    for idx, data in enumerate(loader):
+    for idx, data in tqdm(enumerate(loader), desc=f"{mode} evaluation"):
         if idx*o.batch_size>o.val_pairs and mode=='val':
             break
         start = time.time()
-        new_minimal_models(data, o.val_samples, max_average_sol=o.avg_solutions, min_sample=o.minimal_sample, solver=o.min_solver)
+        # new_minimal_models(data, o.val_samples, max_average_sol=o.avg_solutions, min_sample=o.minimal_sample, solver=o.min_solver)
+        new_minimal_models(data, o.val_samples, max_average_sol=o.avg_solutions)
         end = time.time()
         if idx == 0:
             print(f"new_minimal_models takes {end - start:.4f} seconds")
@@ -322,7 +324,8 @@ def evaluate_T(loader, n_pairs):
     for idx, data in enumerate(loader):
         if idx*o.batch_size>n_pairs:
             break
-        new_minimal_models(data, o.val_samples, max_average_sol=5)
+        # new_minimal_models(data, o.val_samples, max_average_sol=5)
+        new_minimal_models(data, o.val_samples, max_average_sol=o.avg_solutions)
         data['models'] = data['models'].cuda()
         errors, errors_r, errors_t = new_errors(data)
         compute_residuals(data)
@@ -1332,7 +1335,8 @@ if o.var or o.largeval:
     # load or compute T results
     for val_src in vt_scenes:
         val_src_name = val_src.replace('/','_')
-        var_file = res_root + val_src + '/val_T.pkl'
+        # var_file = res_root + val_src + '/val_T.pkl'
+        var_file = res_root + val_src + '/val_T1.pkl'
         if os.path.exists(var_file) and not o.recompute: # recompute flag off
             print(f'loading {var_file}')
             eval_results = load_object(var_file)
@@ -1354,64 +1358,64 @@ if o.var or o.largeval:
     MM = [M for M in methods if not(isinstance(M, MethodGT) or isinstance(M, Oracle) or hasattr(M, 'locked'))]
         
 # %%
-if o.var:
-    print('Measuring Test Error Variance for fixed training sample size')
-    # MM = [M for M in methods if not(isinstance(M, MethodGT) or isinstance(M, Oracle) or hasattr(M, 'locked'))]
-    # concatenate all val results together and all test results together
-    # e_val = dict()
-    # e_test = dict()
-    eres = {M.name:dotdict() for M in MM}
-    for M in MM:
-        name = M.name
-        e_val = np.concatenate([res[s][name].best_e for s in val_scenes], axis=0) # [B, T] (i. e. [image pair, threshold])
-        e_test = np.concatenate([res[s][name].best_e for s in test_scenes], axis=0)
-        # sample bootstrap subsets
-        val_samples = 10 # size of the validation sample
-        bootstrap_samples = 5000 # how many times to re-draw the validation subset
-        n = e_val.shape[0]
-        ee = []
-        for s in range(bootstrap_samples): #bootstrap samples
-            index = np.random.choice(n, val_samples, replace=False) # choose a validation subset
-            # statistic
-            V = np.median(e_val[index],axis=0) # we use median pose error as the criterion, here median over the selected validation subset
-            t_best = np.argmin(V) # select best hyperparameter
-            # evaluate it on test set
-            e = np.median(e_test[:, t_best]) # all test errors for the selected threshold.
-            # This computes flat median over test scenes, don't we want to compute mean median statistic as usual?
-            ee += [e]
-        ee = np.array(ee) # list of test errors [bootstrap_samples]
-        # Expected test error:
-        Ee = np.mean(ee)
-        # Get a confidence interval on the mean
-        bres = scipy.stats.bootstrap((ee,), np.mean, confidence_level=0.95, method='BCa', n_resamples=10000)
-        ci = bres.confidence_interval
-        d = (ci.high - ci.low)/2
-        eres[name].ee = ee
-        eres[name].expected = Ee
-        eres[name].expected_ci = [ci.low, ci.high]
-        eres[name].expected_d = d
-        print(M.name + f'\t Expected median pose error: {Ee:3.3f} +- {d:3.3f}') # 
-        # Get a confidence interval on std
-        bres = scipy.stats.bootstrap((ee,), np.std, confidence_level=0.95, method='BCa', n_resamples=10000)
-        ci = bres.confidence_interval
-        d = (ci.high - ci.low)/2
-        eres[name].v = np.std(ee)
-        eres[name].ci = [ci.low, ci.high]
-        eres[name].d = d
-# %% print out some examples of test error for different trianing samples
-if o.var:
-    for k in range(20):
-        for M in MM:
-            name = M.name
-            if 'gamma=30' in name or 'RANSAC' in name or 'gamma' in name or 'MSAC' in name:
-                continue
-            name = name.replace('gamma=30.0', '').replace('gamma=10.0', '')
-            if k == 0:
-                print(name + '\t', end='')
-            else:
-                e = eres[M.name].ee[k]
-                print(f'{e:3.2f}\t', end='')
-        print('')
+# if o.var:
+#     print('Measuring Test Error Variance for fixed training sample size')
+#     # MM = [M for M in methods if not(isinstance(M, MethodGT) or isinstance(M, Oracle) or hasattr(M, 'locked'))]
+#     # concatenate all val results together and all test results together
+#     # e_val = dict()
+#     # e_test = dict()
+#     eres = {M.name:dotdict() for M in MM}
+#     for M in MM:
+#         name = M.name
+#         e_val = np.concatenate([res[s][name].best_e for s in val_scenes], axis=0) # [B, T] (i. e. [image pair, threshold])
+#         e_test = np.concatenate([res[s][name].best_e for s in test_scenes], axis=0)
+#         # sample bootstrap subsets
+#         val_samples = 10 # size of the validation sample
+#         bootstrap_samples = 5000 # how many times to re-draw the validation subset
+#         n = e_val.shape[0]
+#         ee = []
+#         for s in range(bootstrap_samples): #bootstrap samples
+#             index = np.random.choice(n, val_samples, replace=False) # choose a validation subset
+#             # statistic
+#             V = np.median(e_val[index],axis=0) # we use median pose error as the criterion, here median over the selected validation subset
+#             t_best = np.argmin(V) # select best hyperparameter
+#             # evaluate it on test set
+#             e = np.median(e_test[:, t_best]) # all test errors for the selected threshold.
+#             # This computes flat median over test scenes, don't we want to compute mean median statistic as usual?
+#             ee += [e]
+#         ee = np.array(ee) # list of test errors [bootstrap_samples]
+#         # Expected test error:
+#         Ee = np.mean(ee)
+#         # Get a confidence interval on the mean
+#         bres = scipy.stats.bootstrap((ee,), np.mean, confidence_level=0.95, method='BCa', n_resamples=10000)
+#         ci = bres.confidence_interval
+#         d = (ci.high - ci.low)/2
+#         eres[name].ee = ee
+#         eres[name].expected = Ee
+#         eres[name].expected_ci = [ci.low, ci.high]
+#         eres[name].expected_d = d
+#         print(M.name + f'\t Expected median pose error: {Ee:3.3f} +- {d:3.3f}') # 
+#         # Get a confidence interval on std
+#         bres = scipy.stats.bootstrap((ee,), np.std, confidence_level=0.95, method='BCa', n_resamples=10000)
+#         ci = bres.confidence_interval
+#         d = (ci.high - ci.low)/2
+#         eres[name].v = np.std(ee)
+#         eres[name].ci = [ci.low, ci.high]
+#         eres[name].d = d
+# # %% print out some examples of test error for different trianing samples
+# if o.var:
+#     for k in range(20):
+#         for M in MM:
+#             name = M.name
+#             if 'gamma=30' in name or 'RANSAC' in name or 'gamma' in name or 'MSAC' in name:
+#                 continue
+#             name = name.replace('gamma=30.0', '').replace('gamma=10.0', '')
+#             if k == 0:
+#                 print(name + '\t', end='')
+#             else:
+#                 e = eres[M.name].ee[k]
+#                 print(f'{e:3.2f}\t', end='')
+#         print('')
        
 
 # %%
@@ -1494,16 +1498,17 @@ if o.var:
                     # sigma=2
                     tt = M.hyperparams
                     if adjust_thresholds:
+                        MAGSAC_t_factor = 2
                         if 'MAGSAC' in name:
                             # drop_mask = np.ones(len(tt))
                             # drop_mask[4:200:3] = 0
                             # V[drop_mask>0] = 100
-                            V[tt<0.3] = 1000 # range adjustment
+                            V[tt<0.1*MAGSAC_t_factor] = 1000 # range adjustment
                             if subsample_MAGSAC: # make the number of points tried approximatelly equal only evry 3rd is retained
                                 V[5::3] = 1000
                                 V[6::3] = 1000
                         else:
-                            V[tt>o.max_distance/3] = 1000
+                            V[tt>o.max_distance/MAGSAC_t_factor] = 1000
                         # sigma *= 3
                     if sigma > 0:
                         assert(False)
@@ -1739,9 +1744,14 @@ def err_vs_T(scenes = [], val_samples=None, bootstrap_samples = 100):
     
 # %%
 if o.largeval:
+    tv_scenes = val_scenes + test_scenes
+    np.random.seed(2)
+    print(f'Large Validation on {len(tv_scenes)} scenes')
+    val = [tv_scenes[i] for i in np.random.permutation(len(tv_scenes))[0:5]]
     # print("Computing validation erorrs vs T")
-    eres_large = err_vs_T(scenes = val_scenes + test_scenes)
+    # eres_large = err_vs_T(scenes = val_scenes + test_scenes)
     # eres_large = err_vs_T(scenes = val_scenes, val_samples=2000)
+    eres_large = err_vs_T(scenes = val, bootstrap_samples=100)
 
 #%% 
 if o.largeval:
@@ -1850,10 +1860,10 @@ if o.largeval:
     # plt.title('Selected kernels')
     plt.xlim(0,10)
     plt.xlabel('Residual [px]')
-    plt.show()
     plt.draw()
     force_path(fig_path)
     savefig(fig_path + f'validation_kernels.pdf')
+    plt.show()
 
     force_path(val_file)
     save_object(val_file, methods)

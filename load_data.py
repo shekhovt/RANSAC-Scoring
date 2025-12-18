@@ -593,10 +593,11 @@ class H_dataset(data.Dataset):
         C = np.concatenate((C, np.full((max(0, N - C.shape[0]), C.shape[1]), np.float32(np.inf))), axis=0)
         snn = data['snn']
         snn = np.concatenate((snn, np.ones((max(0, N - snn.shape[0])))), axis=0)
-        inliers = data['inliers']
-        inliers = np.concatenate((inliers, np.zeros((max(0, N - inliers.shape[0])), dtype=bool)), axis=0)
+        if 'inliers' in data:
+            inliers = data['inliers']
+            inliers = np.concatenate((inliers, np.zeros((max(0, N - inliers.shape[0])), dtype=bool)), axis=0)
+            data['inliers'] = inliers
         data['snn'] = snn
-        data['inliers'] = inliers
         data['correspondences'] = C
 
     def __getitem__load(self, index):

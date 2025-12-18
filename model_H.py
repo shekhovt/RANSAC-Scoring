@@ -409,7 +409,7 @@ def compute_residuals(data):
 
 
 def new_minimal_models(data, m_batch_size, max_average_sol=None, include_GT=False):
-    return model.new_minimal_models(data, m_batch_size, max_average_sol=max_average_sol, include_GT=include_GT, solver = model.solve_homography, min_sample=4, validation_fn=validate_homography)
+    return model.new_minimal_models(data, m_batch_size, max_average_sol=max_average_sol, include_GT=include_GT, solver = solve_homography, min_sample=4, validation_fn=validate_homography)
     
 # def normalized_homography(H, K1, K2):
 #     normalizedHomography = np.linalg.inv(K2).dot(H1to2).dot(K1)
