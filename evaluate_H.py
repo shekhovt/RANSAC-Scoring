@@ -73,9 +73,9 @@ o = SimpleNamespace(**vars(ops))
 # o.geom = True
 # o.inliers = True
 # o.R = True
-o.var = True
+# o.var = True
 # o.var = False
-o.largeval = True
+# o.largeval = True
 ##
 ##
 
@@ -109,7 +109,7 @@ if dataset_info.name != o.data:
 o.type = dataset_info.type
 
 if dataset_info.type == 'H':
-    from .model_H import new_minimal_models, pose_error_batch_torch, compute_residuals
+    from .model_H import new_minimal_models, pose_error_batch_torch, compute_residuals, new_minimal_models_H
     o.minimal_sample = 4
     o.avg_solutions = 1
     o.min_solver = model_H.solve_homography
@@ -118,14 +118,14 @@ if dataset_info.type == 'H':
 else:
     from .model_E import new_minimal_models, pose_error_batch_torch, compute_residuals
     o.minimal_sample = 5
-    o.avg_solutions = 1
+    o.avg_solutions = 5
     o.MAGSAC_dof = 4
 
 
 Eval_GCMAGSAC = False
 
-val_scenes = dataset_info.val
-# val_scenes = dataset_info.test[1:2]
+# val_scenes = dataset_info.val
+val_scenes = dataset_info.test[1:2]
 # val_scenes = dataset_info.val + dataset_info.test[0:4]
 # val_scenes = dataset_info.val + dataset_info.test
 test_scenes = dataset_info.test
@@ -146,6 +146,8 @@ def create_loader(val_src):
     return loader
     
 torch.manual_seed(0)
+
+# %%
 
 def set_results_paths(folder = ''):
     global results_file
@@ -197,7 +199,7 @@ def evaluate(loader, mode):
         if idx*o.batch_size>o.val_pairs and mode=='val':
             break
         start = time.time()
-        # new_minimal_models(data, o.val_samples, max_average_sol=o.avg_solutions, min_sample=o.minimal_sample, solver=o.min_solver)
+        # new_minimal_models_H(data, o.val_samples, max_average_sol=o.avg_solutions, min_sample=o.minimal_sample, solver=o.min_solver)
         new_minimal_models(data, o.val_samples, max_average_sol=o.avg_solutions)
         end = time.time()
         if idx == 0:
@@ -1336,7 +1338,8 @@ if o.var or o.largeval:
     for val_src in vt_scenes:
         val_src_name = val_src.replace('/','_')
         # var_file = res_root + val_src + '/val_T.pkl'
-        var_file = res_root + val_src + '/val_T1.pkl'
+        # var_file = res_root + val_src + '/val_T1.pkl'
+        var_file = res_root + val_src + '/val_T2.pkl'
         if os.path.exists(var_file) and not o.recompute: # recompute flag off
             print(f'loading {var_file}')
             eval_results = load_object(var_file)
