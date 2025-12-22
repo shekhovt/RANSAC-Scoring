@@ -1501,7 +1501,7 @@ if o.var:
                     # sigma=2
                     tt = M.hyperparams
                     if adjust_thresholds:
-                        MAGSAC_t_factor = 2
+                        MAGSAC_t_factor = 3
                         if 'MAGSAC' in name:
                             # drop_mask = np.ones(len(tt))
                             # drop_mask[4:200:3] = 0
