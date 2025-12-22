@@ -59,7 +59,10 @@ The project provides tools for training and evaluating learned quality measures 
 
 The default dataset for homography evaluation experiments.
 
-1. **Download the HEB dataset** following the instructions from the dataset provider.
+1. **Download the HEB dataset:**
+   
+   Download from: https://polybox.ethz.ch/index.php/s/R5sPelZ8688It92
+   Further infor at: https://github.com/danini/homography-benchmark?tab=readme-ov-file
 
 2. **Create a symbolic link** to the dataset:
    ```bash
@@ -210,6 +213,86 @@ results/
    └── polish0/
        └── validation*.pdf              # Evaluaiton plots for large validatino set
 
+```
+
+## Computing Inlier Residual Distributions
+
+The `h_patches_residuals.py` script computes and analyzes Sampson residual distributions from ground-truth inlier correspondences. This is useful for understanding the statistical properties of inliers and fitting mixture models.
+
+### Prerequisites
+
+Ensure the HPatches dataset is available:
+```bash
+ln -s /path/to/hpatches-sequences-release data/hpatches-sequences-release
+```
+
+### Running the Analysis
+
+**Basic usage:**
+```bash
+python h_patches_residuals.py
+```
+
+The script will:
+1. Load or process the PhotoTourism dataset residual histogram (if available)
+2. Process HPatches sequences to compute ground-truth correspondences
+3. Calculate Sampson residuals for both homography and essential matrix models
+4. Fit chi-squared mixture models to the residual distributions
+5. Generate distribution plots with fitted models
+
+### Configuration Parameters
+
+Key parameters can be adjusted in the script:
+
+- `MAX_KEYPOINTS = 2000`: Maximum number of SIFT keypoints per image
+- `NN_DIST_THRESHOLD = 5`: Maximum distance (pixels) to accept a match
+- `DESCRIPTOR_DISTANCE_THRESHOLD = 400.0`: Maximum L2 descriptor distance
+- `HIST_BINS = 100`: Number of bins for residual histograms
+- `NUM_MIXTURE_COMPONENTS = 3`: Number of chi-squared components in mixture
+- `INCLUDE_I_SEQUENCES = False`: Include illumination sequences (i_*)
+- `INCLUDE_V_SEQUENCES = True`: Include viewpoint sequences (v_*)
+
+### Output
+
+**Cached results:**
+- `data/hpatches-sequences-release/hpatches_symtransfer_stats.npz`: Cached residual statistics
+
+**Generated figures:**
+- `fig/PhotoTourism_dist_F.pdf`: Epipolar residual distribution from PhotoTourism data
+- `fig/HPatches_dist_H.pdf`: Homography residual distribution from HPatches
+- `fig/HPatches_dist_F.pdf`: Epipolar residual distribution from HPatches
+
+**Console output includes:**
+- Fitted mixture model parameters (weights and scales)
+- Residual statistics (min, median, max, mean, std, percentiles)
+- Number of matched correspondences per sequence
+
+### Example Output
+
+```
+Loading descriptor distances from PhotoTourism...
+Reconstructed 10000 samples from normalized histogram
+Fitted 3-component Chi(1) mixture (F-residuals):
+  Component 1: weight=0.6411, Chi(1, σ=0.1887)
+  Component 2: weight=0.2862, Chi(1, σ=0.1887)
+  Component 3: weight=0.0728, Chi(1, σ=0.1887)
+
+Processing HPatches dataset...
+Total matched correspondences: 125483
+Sampson residuals summary: {'min': 0.001, 'median': 0.15, 'max': 2.98}
+```
+
+### Recomputing Results
+
+To force recomputation (ignore cache):
+```bash
+# Edit the script and set:
+RECOMPUTE_RES = True
+```
+
+Then run:
+```bash
+python h_patches_residuals.py
 ```
 
 ## Epipolar Geometry / Futher Experiments

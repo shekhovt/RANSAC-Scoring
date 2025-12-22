@@ -131,7 +131,7 @@ def nearest_neighbors(pts_query, pts_db):
         dists = np.sqrt(d2[np.arange(d2.shape[0]), idxs])
         return idxs, dists
 
-def match_descriptors_ratio_test(desc1, desc2, pts1, pts2, H):
+def match_descriptors_ratio_test(desc1, desc2, pts1, pts2, H, reproj_barrier_threshold=10.0, ratio_threshold=0.9):
     """Match descriptors using Lowe's ratio test with geometric barrier (GPU-accelerated).
     Returns indices of matches in desc1 and desc2.
     
