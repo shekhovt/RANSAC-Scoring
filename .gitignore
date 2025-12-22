@@ -5,6 +5,14 @@ fig/
 PoseLib_1/
 data/
 trash/
+
+# Development folders (excluded from public branch)
+depricated/
+debug/
+exp-tests/
+modelling/
+tests/
+
 *.pyc
 *.pkl
 *.pth
