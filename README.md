@@ -1,4 +1,4 @@
-# Score Learning for Homography Estimation
+# RANSAC Scoring Functions: Analysis and Reality Check
 
 This project implements experiemnts of A. Shekhovtosv "RANSAC Scoring Functions: Analysis and Reality Check" [link and bib to be added].
 
