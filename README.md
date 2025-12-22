@@ -1,6 +1,6 @@
 # Score Learning for Homography Estimation
 
-This project implements learned scoring functions for robust homography estimation using RANSAC-based methods.
+This project implements experiemnts of A. Shekhovtosv "RANSAC Scoring Functions: Analysis and Reality Check" [link and bib to be added].
 
 ## Overview
 
@@ -305,7 +305,7 @@ If you use this code in your research, please cite:
 
 ```bibtex
 @article{shekhovtsov-25-RANSACA,
-  title={RANSAC Scoring Functions: \\ Analysis and Reality Check},
+  title={RANSAC Scoring Functions: Analysis and Reality Check},
   author={Shekhovtsov},
   booktitle={IJCV},
   year={2025},
